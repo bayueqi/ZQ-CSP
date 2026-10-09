@@ -53,11 +53,11 @@ const DEFAULT_SOURCES = {
 
 const DEFAULT_CONFIG = {
   domain: "香港",            // 定时任务默认优选的地区（可填国家中文名或两位国家码，如 香港 / HK）
-  concurrency: 16,          // 并发检测数
-  timeoutMs: 10000,         // 单条检测超时，所有协议统一使用
+  concurrency: 16,
+  timeoutMs: 10000,
   budgetMs: 5000,           // 单次 /api/optimize 调用的时间片（内部固定值，不在面板中暴露）
                             // 这个值也是「暂停优选」的响应上限：点暂停后，当前这一片跑完才会停
-  autoTypes: ["socks5", "http", "https", "sstp"],  // 定时任务跑哪些
+  autoTypes: ["socks5", "http", "https", "sstp"],
   sources: DEFAULT_SOURCES,
 };
 
@@ -132,7 +132,6 @@ const CONTINENT_ORDER = ["AS", "EU", "NA", "SA", "AF", "OC", "AN", "OTHER"];
 // 国家码 → 大洲码。兜底用，源里有 continent 字段时以源为准。
 // 注意：这里是"国家码"当键、"大洲码"当值，所以 NA(纳米比亚)→AF、AS(美属萨摩亚)→OC 不冲突。
 const COUNTRY_CONTINENT = {
-  // 亚洲
   AE: "AS", AF: "AS", AM: "AS", AZ: "AS", BD: "AS", BH: "AS", BN: "AS", BT: "AS", CN: "AS",
   CY: "AS", GE: "AS", HK: "AS", ID: "AS", IL: "AS", IN: "AS", IO: "AS", IQ: "AS",
   IR: "AS", JO: "AS", JP: "AS", KG: "AS", KH: "AS", KP: "AS", KR: "AS", KW: "AS",
@@ -140,7 +139,6 @@ const COUNTRY_CONTINENT = {
   MY: "AS", NP: "AS", OM: "AS", PH: "AS", PK: "AS", PS: "AS", QA: "AS", SA: "AS",
   SG: "AS", SY: "AS", TH: "AS", TJ: "AS", TL: "AS", TM: "AS", TR: "AS", TW: "AS",
   UZ: "AS", VN: "AS", YE: "AS",
-  // 欧洲
   AD: "EU", AL: "EU", AT: "EU", AX: "EU", BA: "EU", BE: "EU", BG: "EU", BY: "EU",
   CH: "EU", CZ: "EU", DE: "EU", DK: "EU", EE: "EU", ES: "EU", FI: "EU", FO: "EU",
   FR: "EU", GB: "EU", GG: "EU", GI: "EU", GR: "EU", HR: "EU", HU: "EU", IE: "EU",
@@ -148,17 +146,14 @@ const COUNTRY_CONTINENT = {
   MC: "EU", MD: "EU", ME: "EU", MK: "EU", MT: "EU", NL: "EU", NO: "EU", PL: "EU",
   PT: "EU", RO: "EU", RS: "EU", RU: "EU", SE: "EU", SI: "EU", SJ: "EU", SK: "EU",
   SM: "EU", UA: "EU", VA: "EU",
-  // 北美 / 中美 / 加勒比
   AG: "NA", AI: "NA", AW: "NA", BB: "NA", BL: "NA", BM: "NA", BQ: "NA", BS: "NA",
   BZ: "NA", CA: "NA", CR: "NA", CU: "NA", CW: "NA", DM: "NA", DO: "NA", GD: "NA",
   GL: "NA", GP: "NA", GT: "NA", HN: "NA", HT: "NA", JM: "NA", KN: "NA", KY: "NA",
   LC: "NA", MF: "NA", MQ: "NA", MS: "NA", MX: "NA", NI: "NA", PA: "NA", PM: "NA",
   PR: "NA", SV: "NA", SX: "NA", TC: "NA", TT: "NA", US: "NA", VC: "NA", VG: "NA",
   VI: "NA",
-  // 南美
   AR: "SA", BO: "SA", BR: "SA", CL: "SA", CO: "SA", EC: "SA", FK: "SA", GF: "SA",
   GY: "SA", PE: "SA", PY: "SA", SR: "SA", UY: "SA", VE: "SA",
-  // 非洲
   AO: "AF", BF: "AF", BI: "AF", BJ: "AF", BW: "AF", CD: "AF", CF: "AF", CG: "AF",
   CI: "AF", CM: "AF", CV: "AF", DJ: "AF", DZ: "AF", EG: "AF", EH: "AF", ER: "AF",
   ET: "AF", GA: "AF", GH: "AF", GM: "AF", GN: "AF", GQ: "AF", GW: "AF", KE: "AF",
@@ -167,12 +162,10 @@ const COUNTRY_CONTINENT = {
   SC: "AF", SD: "AF", SH: "AF", SL: "AF", SN: "AF", SO: "AF", SS: "AF", ST: "AF",
   SZ: "AF", TD: "AF", TG: "AF", TN: "AF", TZ: "AF", UG: "AF", YT: "AF", ZA: "AF",
   ZM: "AF", ZW: "AF",
-  // 大洋洲
   AS: "OC", AU: "OC", CC: "OC", CK: "OC", CX: "OC", FJ: "OC", FM: "OC", GU: "OC",
   HM: "OC", KI: "OC", MH: "OC", MP: "OC", NC: "OC", NF: "OC", NR: "OC", NU: "OC",
   NZ: "OC", PF: "OC", PG: "OC", PN: "OC", PW: "OC", SB: "OC", TK: "OC", TO: "OC",
   TV: "OC", UM: "OC", VU: "OC", WF: "OC", WS: "OC",
-  // 南极洲
   AQ: "AN", BV: "AN", GS: "AN", TF: "AN",
 };
 
@@ -1302,7 +1295,6 @@ function pickCountry(item) {
 }
 
 // 只刷新候选池，绝对不动 best（已优选出的结果与进度）。
-// 之前这里会把 best 重置成 EMPTY_BEST，导致每次进面板自动拉取后结果全没了。
 // 池子换了之后游标的作废放在 runChunk 里判断（按池子大小），不在这里一刀切清空。
 async function fetchAndStore(env, type, cfg) {
   const items = await fetchCandidates(type, cfg);
@@ -1474,8 +1466,6 @@ function resolveCountryCode(input) {
 
 async function buildState(env, cfg) {
   const state = { config: cfg, types: {}, meta: await kvGet(env, "meta", {}) };
-  // 并发读：原来 5 个协议逐个 await（共 16 次串行 KV 读），池子大的协议一读就是几百毫秒。
-  // 改成一轮 Promise.all，协议内 pool/best/regions 也并发，首屏等待从"累加"变"取最慢那个"。
   const built = await Promise.all(PROTOCOLS.map(async (type) => {
     const [pool, best, regionSelected] = await Promise.all([
       kvGet(env, "pool:" + type, { items: [], fetchedAt: 0 }),
@@ -2091,11 +2081,10 @@ code{background:#f2f4f7;border:1px solid var(--line2);border-radius:6px;padding:
 <div class="modal" id="mSettings">
   <div class="mbox">
     <h3><span class="dot"></span>设置</h3>
-    <label class="f">管理密码（留空 = 不修改）<input type="password" id="cfgPwd" placeholder="至少 4 位"></label>
-    <label class="f">DOMAIN · 定时优选地区<input type="text" id="cfgDomain" placeholder="香港"></label>
+    <label class="f">管理密码<input type="password" id="cfgPwd" placeholder="至少 4 位"></label>
+    <label class="f">定时优选地区<input type="text" id="cfgDomain" placeholder="香港"></label>
     <label class="f">并发数（1–32）<input type="number" id="cfgConcurrency" min="1" max="32"></label>
     <label class="f">超时时间 ms<input type="number" id="cfgTimeoutMs" min="1000" max="120000" step="500"></label>
-    <div class="hint">DOMAIN 填国家名（香港 / 日本）或两位国家码（HK / JP），定时任务按它挑地区；候选池里没有该地区时会自动跑全部地区。定时任务固定跑 SOCKS5、HTTP、HTTPS、SSTP 四类。</div>
     <div class="row" style="justify-content:flex-end;margin-top:16px">
       <button id="btnSettingsCancel">取消</button>
       <button class="primary" id="btnSettingsSave">保存</button>
@@ -2233,7 +2222,6 @@ code{background:#f2f4f7;border:1px solid var(--line2);border-radius:6px;padding:
     return '<div class="metric' + (cls ? ' ' + cls : '') + '"><span class="k">' + k + '</span><b>' + v + '</b></div>';
   }
 
-  // 已测进度百分比
   function pctOf(t){ return t.total > 0 ? Math.min(100, Math.round(t.done * 100 / t.total)) : 0; }
 
   // 进度条：跑完变绿；style 用于概览卡把进度条吸到底部
@@ -2241,7 +2229,6 @@ code{background:#f2f4f7;border:1px solid var(--line2);border-radius:6px;padding:
     return '<div class="bar' + (t.finished && t.total > 0 ? ' done' : '') + '"' + (style ? ' style="' + style + '"' : '') + '><i style="width:' + pctOf(t) + '%"></i></div>';
   }
 
-  // 国家/地区单元格：旗帜 + 中文名
   function countryCell(r){ return esc((r.countryEmoji ? r.countryEmoji + ' ' : '') + (r.countryName || r.country)); }
 
   // 结果行：协议页（带「状态」列和失败原因行）与概览（不带）共用
@@ -2695,8 +2682,6 @@ code{background:#f2f4f7;border:1px solid var(--line2);border-radius:6px;padding:
   })();
 
   renderBoot();
-  // 先等首屏状态回来，再开始自动拉取 —— 避免 /api/fetch 的大写入跟 /api/state 的读取抢资源，
-  // 把首屏又往后推（原来这两句是挨着同时发的）。
   loadState().then(function(){ autoFetchAll(); });
 })();
 </script>
