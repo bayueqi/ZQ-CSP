@@ -423,9 +423,8 @@ const EXT_SERVER_NAME=0,EXT_SUPPORTED_GROUPS=10,EXT_EC_POINT_FORMATS=11,EXT_SIGN
 const ALERT_CLOSE_NOTIFY=0,ALERT_LEVEL_WARNING=1,ALERT_UNRECOGNIZED_NAME=112;
 const shouldIgnoreTlsAlert=(fragment)=>fragment?.[0]===ALERT_LEVEL_WARNING&&fragment?.[1]===ALERT_UNRECOGNIZED_NAME;
 
-const textEncoder=new TextEncoder();
-const textDecoder=new TextDecoder();
-const EMPTY_BYTES=new Uint8Array(0);
+// 与上面代理层的 proxyTextEncoder / proxyTextDecoder / SSTP_EMPTY_BYTES 是同一个东西，直接复用
+const textEncoder=proxyTextEncoder,textDecoder=proxyTextDecoder,EMPTY_BYTES=SSTP_EMPTY_BYTES;
 
 const CIPHER_SUITES_BY_ID=new Map([
     [4865,{id:4865,keyLen:16,ivLen:12,hash:"SHA-256",tls13:!0}],
@@ -2164,7 +2163,7 @@ function groupRegions(items, selected) {
       map[code] = {
         code,
         name: item.countryCn || countryName(code, item.countryEn || ""),
-        emoji: item.countryEmoji || "",
+        emoji: item.countryEmoji || countryFlag(code),
         continent,
         continentName: item.continentCn || CONTINENT_LABEL[continent] || continent,
         continentEmoji: CONTINENT_EMOJI[continent] || "🌐",
@@ -2200,9 +2199,15 @@ function sortedResults(entry) {
 }
 
 function countryName(code, fallback) {
-  if (fallback) return fallback;
   const key = String(code || "").toUpperCase();
-  return COUNTRY_ZH[key] || key || "XX";
+  return COUNTRY_ZH[key] || fallback || key || "XX";
+}
+
+// 两位国家码 → 国旗 emoji，数据源没带 emoji 时（VPN Gate）用
+function countryFlag(code) {
+  const key = String(code || "").toUpperCase();
+  if (!/^[A-Z]{2}$/.test(key) || key === "XX") return "";
+  return String.fromCodePoint(key.charCodeAt(0) + 127397, key.charCodeAt(1) + 127397);
 }
 
 // 中文国名 → 两位国家码（COUNTRY_ZH 的反查表），供 DOMAIN 变量用
@@ -2271,7 +2276,7 @@ async function buildState(env, cfg) {
       results: items.slice(0, 200).map((x) => ({
         address: x.item.address,
         country: (x.result && x.result.country) || x.item.country || "",
-        countryEmoji: x.item.countryEmoji || "",
+        countryEmoji: x.item.countryEmoji || countryFlag((x.result && x.result.country) || x.item.country || ""),
         countryName: x.item.countryCn || countryName((x.result && x.result.country) || x.item.country, x.item.countryEn || ""),
         city: x.item.city || "",
         org: x.item.org || "",
@@ -2735,6 +2740,25 @@ tr.dead td{color:var(--tx3)}
 .pill.ok{background:var(--ok-bg);color:var(--ok)}
 .pill.bad{background:var(--bad-bg);color:var(--bad)}
 
+/* 表格里的地址：点了就复制 */
+.addr{cursor:pointer}
+.addr:hover{color:var(--brand);text-decoration:underline dotted;text-underline-offset:3px}
+.toast{position:fixed;left:50%;bottom:28px;z-index:90;max-width:80vw;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;background:#101828;color:#fff;font-size:12.5px;padding:8px 15px;border-radius:999px;opacity:0;pointer-events:none;transform:translate(-50%,8px);transition:opacity .18s ease,transform .18s ease}
+.toast.on{opacity:1;transform:translate(-50%,0)}
+
+/* 单点测试结果条：左侧色条 + 状态胶囊 + 延迟 + 出口 */
+.tres{position:relative;display:flex;align-items:center;gap:22px;row-gap:10px;flex-wrap:wrap;overflow:hidden;margin-top:8px;padding:10px 14px 10px 18px;border:1px solid var(--line2);border-radius:10px;background:#f8f9fb;font-size:12.5px;color:var(--tx2)}
+.tres::before{content:"";position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--tx3)}
+.tres.ok{background:var(--ok-bg);border-color:#cbe9d8;color:var(--tx)}
+.tres.ok::before{background:var(--ok)}
+.tres.bad{background:var(--bad-bg);border-color:#f5cdc9;color:var(--tx)}
+.tres.bad::before{background:var(--bad)}
+.tres .pill{color:#fff}
+.tres .pill.ok{background:var(--ok)}
+.tres .pill.bad{background:var(--bad)}
+.tres .geo{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:500}
+.tres .err{min-width:0;color:var(--bad);word-break:break-word}
+
 .hint{color:var(--tx2);font-size:12.5px;margin-top:8px}
 .hint code,.row code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
 code{background:#f2f4f7;border:1px solid var(--line2);border-radius:6px;padding:2px 7px;font-size:12.5px;display:inline-block;max-width:100%;overflow:hidden;text-overflow:ellipsis;vertical-align:middle}
@@ -2861,7 +2885,7 @@ code{background:#f2f4f7;border:1px solid var(--line2);border-radius:6px;padding:
 <div class="modal" id="mSettings">
   <div class="mbox">
     <h3><span class="dot"></span>设置</h3>
-    <label class="f">管理密码<input type="password" id="cfgPwd" placeholder="至少 4 位"></label>
+    <label class="f">管理密码<input type="text" id="cfgPwd" autocomplete="off" placeholder="至少 4 位" style="-webkit-text-security:disc" onfocus="this.type='password'" onblur="this.type='text'"></label>
     <label class="f">定时优选地区<input type="text" id="cfgDomain" placeholder="香港"></label>
     <label class="f">并发数（1–32）<input type="number" id="cfgConcurrency" min="1" max="32"></label>
     <label class="f">超时时间 ms<input type="number" id="cfgTimeoutMs" min="1000" max="120000" step="500"></label>
@@ -2955,6 +2979,17 @@ code{background:#f2f4f7;border:1px solid var(--line2);border-radius:6px;padding:
     } else { fallback(); }
   }
 
+  // 复制后弹一条提示：日志卡片在页面底部，表格里点一下看不到反馈
+  var toastTimer = null;
+  function toast(msg){
+    var node = el('toast');
+    if(!node){ node = document.createElement('div'); node.id = 'toast'; node.className = 'toast'; document.body.appendChild(node); }
+    node.textContent = msg;
+    node.className = 'toast on';
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(function(){ node.className = 'toast'; }, 1800);
+  }
+
   function apiUrl(type){ return location.origin + '/list/' + type + (PWD ? '?pwd=' + encodeURIComponent(PWD) : ''); }
 
   function apiBox(type){
@@ -3015,8 +3050,8 @@ code{background:#f2f4f7;border:1px solid var(--line2);border-radius:6px;padding:
   function rowHtml(r, idx, withStatus){
     var html = '<tr' + (withStatus && !r.ok ? ' class="dead"' : '') + '>';
     html += '<td class="mono">' + (idx + 1) + '</td>';
-    html += '<td class="mono" title="' + esc(r.address) + '">' + esc(r.address) + '</td>';
-    if(withStatus) html += '<td>' + (r.ok ? '<span class="pill ok">通</span>' : '<span class="pill bad">失败</span>') + '</td>';
+    html += '<td class="mono addr" data-copy="' + esc(r.address) + '" title="点击复制">' + esc(r.address) + '</td>';
+    if(withStatus) html += '<td>' + (r.ok ? '<span class="pill ok">成功</span>' : '<span class="pill bad">失败</span>') + '</td>';
     html += '<td class="mono">' + fmtMs(r.latency) + '</td>';
     html += '<td class="mono">' + esc(r.exitIp) + '</td>';
     html += '<td>' + countryCell(r) + '</td>';
@@ -3054,22 +3089,22 @@ code{background:#f2f4f7;border:1px solid var(--line2);border-radius:6px;padding:
     var gate = ' data-gate="region"' + (noRegion ? ' disabled title="请先选择地区"' : '');
     html += '<div class="row">';
     if(RUNNING[type]){
-      html += '<button class="primary" data-act="pause" data-type="' + type + '">暂停优选</button>';
+      html += '<button type="button" class="primary" data-act="pause" data-type="' + type + '">暂停优选</button>';
     } else if(partial){
-      html += '<button class="primary" data-act="cont" data-type="' + type + '"' + gate + '>继续优选</button>';
+      html += '<button type="button" class="primary" data-act="cont" data-type="' + type + '"' + gate + '>继续优选</button>';
     } else {
-      html += '<button class="primary" data-act="start" data-type="' + type + '"' + gate + '>开始优选</button>';
+      html += '<button type="button" class="primary" data-act="start" data-type="' + type + '"' + gate + '>开始优选</button>';
     }
-    html += '<button data-act="region" data-type="' + type + '">' + (picked.length ? '地区：' + esc(pickedName) : '选择地区') + '</button>';
-    html += '<button class="danger" data-act="clear" data-type="' + type + '">清空结果</button>';
+    html += '<button type="button" data-act="region" data-type="' + type + '">' + (picked.length ? '地区：' + esc(pickedName) : '选择地区') + '</button>';
+    html += '<button type="button" class="danger" data-act="clear" data-type="' + type + '">清空结果</button>';
     if(noRegion) html += '<span class="hint" style="margin:0;color:var(--bad)">先点「选择地区」选一个地区</span>';
-    html += '<input type="text" id="test-' + type + '" class="mono" placeholder="单点测试：' + esc(POOL_PLACEHOLDER[type]) + '" style="flex:1;min-width:200px">';
-    html += '<button data-act="test" data-type="' + type + '">测试</button>';
+    html += '<input type="text" id="test-' + type + '" class="mono" autocomplete="off" placeholder="单点测试：' + esc(POOL_PLACEHOLDER[type]) + '" style="flex:1;min-width:200px">';
+    html += '<button type="button" data-act="test" data-type="' + type + '">测试</button>';
     html += '</div>';
     html += '<div class="regbox' + (REGOPEN[type] ? ' open' : '') + '" id="regionbox-' + type + '">';
     html += '<div class="regscroll" style="margin-top:8px">' + regionList(type, t.regions || []) + '</div>';
     html += '</div>';
-    html += '<div id="testout-' + type + '" class="hint" style="display:none"></div>';
+    html += '<div id="testout-' + type + '" class="tres" style="display:none"></div>';
     html += resultTable(t.results);
     html += '</div>';
     return html;
@@ -3136,9 +3171,9 @@ code{background:#f2f4f7;border:1px solid var(--line2);border-radius:6px;padding:
       if(!prows.length){
         html += '<div class="empty">暂无可用节点。</div>';
       } else {
-        html += '<div class="scroll" style="max-height:none"><table><thead><tr><th>#</th><th>地址</th><th>延迟</th><th>出口 IP</th><th>国家/地区</th></tr></thead><tbody>';
-        for(var n = 0; n < prows.length; n++) html += rowHtml(prows[n].r, n, false);
-        html += '</tbody></table></div>';
+        var orows = [];
+        for(var n = 0; n < prows.length; n++) orows.push(prows[n].r);
+        html += tableShell(orows, false, 'max-height:none');
       }
       html += '</div>';
       html += '</div>';
@@ -3147,12 +3182,17 @@ code{background:#f2f4f7;border:1px solid var(--line2);border-radius:6px;padding:
     return html;
   }
 
+  // 结果表外壳：概览页不带「状态」列、也不限高，列头和外壳就收在这一处
+  function tableShell(rows, withStatus, style){
+    var head = '<tr><th>#</th><th>地址</th>' + (withStatus ? '<th>状态</th>' : '') + '<th>延迟</th><th>出口 IP</th><th>国家/地区</th></tr>';
+    var body = '';
+    for(var i = 0; i < rows.length; i++) body += rowHtml(rows[i], i, withStatus);
+    return '<div class="scroll"' + (style ? ' style="' + style + '"' : '') + '><table><thead>' + head + '</thead><tbody>' + body + '</tbody></table></div>';
+  }
+
   function resultTable(rows){
     if(!rows || !rows.length) return '<div class="scroll"><div class="empty">还没有结果，点「开始优选」会先拉取候选再检测。</div></div>';
-    var html = '<div class="scroll"><table><thead><tr><th>#</th><th>地址</th><th>状态</th><th>延迟</th><th>出口 IP</th><th>国家/地区</th></tr></thead><tbody>';
-    for(var i = 0; i < rows.length; i++) html += rowHtml(rows[i], i, true);
-    html += '</tbody></table></div>';
-    return html;
+    return tableShell(rows, true);
   }
 
   function regionList(type, regions){
@@ -3247,7 +3287,7 @@ code{background:#f2f4f7;border:1px solid var(--line2);border-radius:6px;padding:
     for(var i = 0; i < nodes.length; i++){
       nodes[i].addEventListener('click', function(ev){
         var cp = this.getAttribute('data-copy');
-        if(cp){ ev.preventDefault(); copyText(cp); return; }
+        if(cp){ ev.preventDefault(); copyText(cp); toast('已复制：' + cp); return; }
         var tab = this.getAttribute('data-tab');
         if(tab){ ACTIVE = tab; render(); return; }
         var goto = this.getAttribute('data-goto');
@@ -3396,14 +3436,10 @@ code{background:#f2f4f7;border:1px solid var(--line2);border-radius:6px;padding:
     return true;
   }
 
-  // 开始优选 = 先拉取候选（刷新池子）+ 从零优选
+  // 开始优选 = 直接用进面板时已拉取的候选池，从零优选（不再重复拉取）
   function doStart(type){
-    if(!beginRun(type, '开始优选 ' + LABELS[type] + '：拉取候选…')) return;
-    api('/api/fetch', { type: type }).then(function(f){
-      if(!f.success){ finish(type, LABELS[type] + ' 拉取候选失败：' + f.error); return; }
-      log(LABELS[type] + ' 候选 ' + f.poolCount + ' 条，开始检测…', type);
-      runChunks(type, true, function(msg){ finish(type, LABELS[type] + ' ' + msg); });
-    }).catch(function(e){ finish(type, LABELS[type] + ' 异常：' + e.message); });
+    if(!beginRun(type, '开始优选 ' + LABELS[type] + '…')) return;
+    runChunks(type, true, function(msg){ finish(type, LABELS[type] + ' ' + msg); });
   }
 
   // 继续优选 = 用现有池子接着上次的进度跑（不重拉）
@@ -3430,17 +3466,61 @@ code{background:#f2f4f7;border:1px solid var(--line2);border-radius:6px;padding:
     }).catch(function(e){ setBusy(type, false); log(type + ' 清空异常：' + e.message, type); });
   }
 
+  // 出口 IP → 中文地理位置「日本 / 東京都 / 中野區」（ipwho.is，免 key，HTTPS + CORS）
+  // 由浏览器直接请求：用访问者自己的配额，避开 Worker 共享出网 IP 被上游限流
+  function lookupGeo(ip, cb){
+    var clean = String(ip || '').replace(/^\[|\]$/g, '').trim();
+    if(!clean){ cb(''); return; }
+    var done = false;
+    var fin = function(v){ if(done) return; done = true; cb(v || ''); };
+    setTimeout(function(){ fin(''); }, 4000);
+    fetch('https://ipwho.is/' + encodeURIComponent(clean) + '?lang=zh-CN')
+      .then(function(res){ return res.json(); })
+      .then(function(d){
+        if(!d || !d.success) return fin('');
+        // 三级同名很常见（香港三级都是「香港」、日本省市都是「東京都」），整串去重只留先出现的
+        var raw = [d.country || d.country_code || '', d.region || '', d.city || ''];
+        var p = [];
+        for(var i = 0; i < raw.length; i++){
+          var v = String(raw[i] || '').trim();
+          if(v && p.indexOf(v) < 0) p.push(v);
+        }
+        fin(p.join(' / '));
+      })
+      .catch(function(){ fin(''); });
+  }
+
+  // 单点测试结果：状态胶囊 + 地理位置 + 延迟，形如「✓ 通过  日本 / 東京都 / 中野區  1756 ms」
+  function testHtml(r){
+    if(!r.ok){
+      return '<span class="pill bad">✕ 失败</span>'
+        + '<span class="err">' + esc(r.error || '未知错误') + '</span>'
+        + '<span class="tag mono">' + esc(r.latency) + ' ms</span>';
+    }
+    return '<span class="pill ok">✓ 通过</span>'
+      + '<span class="geo">' + esc(r.location || r.exitIp || '—') + '</span>'
+      + '<span class="tag mono">' + esc(r.latency) + ' ms</span>';
+  }
+
   function doTest(type){
     var input = el('test-' + type);
     var out = el('testout-' + type);
     var address = (input.value || '').trim();
-    if(!address){ out.style.display = 'block'; out.textContent = '请先填一个地址'; return; }
-    out.style.display = 'block';
+    out.style.display = 'flex';   // 必须 flex：写 block 会用内联样式盖掉 .tres 的 display:flex，gap 失效
+    out.className = 'tres';
+    if(!address){ out.textContent = '请先填一个地址'; return; }
     out.textContent = '测试中…';
     api('/api/test', { type: type, address: address }).then(function(r){
-      if(r.ok) out.textContent = '通过：' + r.latency + ' ms · 出口 ' + (r.exitIp || '') + ' · ' + (r.country || '') + (r.colo ? (' · ' + r.colo) : '') + (r.mode ? (' · ' + r.mode) : '');
-      else out.textContent = '失败：' + (r.error || '未知错误') + '（' + r.latency + ' ms）';
-    }).catch(function(e){ out.textContent = '异常：' + e.message; });
+      var show = function(){
+        out.className = 'tres ' + (r.ok ? 'ok' : 'bad');
+        out.innerHTML = testHtml(r);
+      };
+      if(r.ok && r.exitIp){ lookupGeo(r.exitIp, function(loc){ r.location = loc; show(); }); }
+      else { show(); }
+    }).catch(function(e){
+      out.className = 'tres bad';
+      out.innerHTML = '<span class="pill bad">✕ 异常</span><span class="err">' + esc(e.message) + '</span>';
+    });
   }
 
   bind('btnRefreshAll', function(){
