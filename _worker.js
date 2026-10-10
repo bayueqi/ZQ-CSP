@@ -19,7 +19,7 @@ const DEFAULT_CONFIG = {
   timeoutMs: 10000,
   budgetMs: 5000,           // 单次 /api/optimize 调用的时间片（内部固定值，不在面板中暴露）
                             // 这个值也是「暂停优选」的响应上限：点暂停后，当前这一片跑完才会停
-  autoTypes: ["socks5", "http", "https", "sstp"],
+  autoTypes: ["socks5", "http", "https", "sstp", "proxyip"],
   sources: DEFAULT_SOURCES,
 };
 
@@ -2044,6 +2044,20 @@ async function loadConfig(env) {
 
 const EMPTY_BEST = { runAt: 0, done: 0, items: [], ok: 0, total: 0, regionsKey: "" };
 
+// 定时任务在「池里没有目标地区」时，从全池随机抽这么多条来测（不扫全部，避免子请求超限）
+const AUTO_FALLBACK_SAMPLE = 20;
+
+// 无偏随机抽样：Fisher-Yates 部分洗牌，不改动原数组
+function randomSample(arr, n) {
+  const list = (Array.isArray(arr) ? arr : []).slice();
+  const take = Math.min(n, list.length);
+  for (let i = 0; i < take; i++) {
+    const j = i + Math.floor(Math.random() * (list.length - i));
+    const t = list[i]; list[i] = list[j]; list[j] = t;
+  }
+  return list.slice(0, take);
+}
+
 // 地区选择：KV key = region:<type>，存国家码数组；空数组 = 全部地区
 // 面板只允许单选；历史数据里若存了多个，这里只保留第一个
 async function getRegions(env, type) {
@@ -3484,17 +3498,34 @@ export default {
       for (const type of types) {
         try {
           const poolCount = await fetchAndStore(env, type, cfg);
-          // 定时任务只跑 DOMAIN 指定的这一个地区；池里没有这个地区就直接跳过，
-          // 不再退回「全部地区」（候选太多、请求量太大，很容易整轮失败）
+          // 定时任务每轮每协议固定测 AUTO_FALLBACK_SAMPLE 条：
+          // 先取 DOMAIN 指定地区的节点，不足 20 条时从全池随机补齐。
+          // 这样既保住地区偏好，又让每轮负载恒定、不会因子请求超限整轮失败。
           const regions = domainCode ? [domainCode] : [];
-          if (regions.length) {
-            const pool = await kvGet(env, "pool:" + type, { items: [] });
-            const hit = (Array.isArray(pool.items) ? pool.items : []).some((x) => pickCountry(x) === domainCode);
-            if (!hit) {
-              summary.push(type + "(" + domainCode + ")池" + poolCount + "/无该地区节点，已跳过");
-              continue;
-            }
+          const pool = await kvGet(env, "pool:" + type, { items: [] });
+          const poolItems = Array.isArray(pool.items) ? pool.items : [];
+          if (!poolItems.length) {
+            summary.push(type + "池" + poolCount + "/池为空已跳过");
+            continue;
           }
+          const regionHits = regions.length
+            ? poolItems.filter((x) => pickCountry(x) === domainCode)
+            : poolItems;
+          let sample;
+          if (regionHits.length >= AUTO_FALLBACK_SAMPLE) {
+            sample = randomSample(regionHits, AUTO_FALLBACK_SAMPLE);
+          } else {
+            // 地区节点不足 20 条 → 全取，再从剩余（非该地区）里随机补足
+            const hitSet = new Set(regionHits);
+            const rest = poolItems.filter((x) => !hitSet.has(x));
+            sample = regionHits.concat(randomSample(rest, AUTO_FALLBACK_SAMPLE - regionHits.length));
+          }
+          await kvPut(env, "pool:" + type, Object.assign({}, pool, { items: sample }));
+          regions.length = 0;   // 已自行抽样，runChunk 不再按地区过滤
+          summary.push(
+            type + "(" + (domainCode || "全部") + ")池" + poolCount +
+            "/地区命中" + regionHits.length + "，本轮抽样" + sample.length + "条"
+          );
           let guard = 0;
           let result = null;
           do {
@@ -3502,7 +3533,8 @@ export default {
             result = await runChunk(env, type, cfg, guard === 0, regions);
             guard++;
           } while (!result.finished && guard < 60);
-          summary.push(type + "(" + (regions.length ? domainCode : "全部地区") + ")池" + poolCount + "/可用" + (result ? result.ok : 0));
+          // 把本轮结果补到上面那条摘要末尾（同一元素，不再 push 第二条）
+          summary[summary.length - 1] += "/可用" + (result ? result.ok : 0);
         } catch (e) {
           summary.push(type + ":失败(" + ((e && e.message) || e) + ")");
         }
