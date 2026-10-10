@@ -2045,7 +2045,7 @@ async function loadConfig(env) {
 const EMPTY_BEST = { runAt: 0, done: 0, items: [], ok: 0, total: 0, regionsKey: "" };
 
 // 定时任务在「池里没有目标地区」时，从全池随机抽这么多条来测（不扫全部，避免子请求超限）
-const AUTO_FALLBACK_SAMPLE = 20;
+const AUTO_FALLBACK_SAMPLE = 100;
 
 // 无偏随机抽样：Fisher-Yates 部分洗牌，不改动原数组
 function randomSample(arr, n) {
@@ -2377,7 +2377,11 @@ async function handleAdmin(request, env, url) {
   return new Response(renderPanel(cfg, stored), { headers: pageHeaders });
 }
 
+// 单点检测也要密码（Cookie 或 ?pwd=），免得被陌生人当免费检测器
 async function handleCheck(request, env, url) {
+  if (!(await authed(request, env, url))) {
+    return json({ error: "未授权：这个地址要带上管理密码，例如 /check?socks5=host:port&pwd=你的密码" }, 401);
+  }
   const protocol = ["socks5", "http", "https", "sstp", "proxyip"].find((k) => url.searchParams.has(k));
   if (!protocol) return json({ error: "缺少代理参数，用法 /check?socks5=host:port（支持 socks5/http/https/sstp/proxyip）" }, 400);
   const address = url.searchParams.get(protocol);
@@ -3499,7 +3503,7 @@ export default {
         try {
           const poolCount = await fetchAndStore(env, type, cfg);
           // 定时任务每轮每协议固定测 AUTO_FALLBACK_SAMPLE 条：
-          // 先取 DOMAIN 指定地区的节点，不足 20 条时从全池随机补齐。
+          // 先取 DOMAIN 指定地区的节点，不足抽样数时从全池随机补齐。
           // 这样既保住地区偏好，又让每轮负载恒定、不会因子请求超限整轮失败。
           const regions = domainCode ? [domainCode] : [];
           const pool = await kvGet(env, "pool:" + type, { items: [] });
@@ -3515,7 +3519,7 @@ export default {
           if (regionHits.length >= AUTO_FALLBACK_SAMPLE) {
             sample = randomSample(regionHits, AUTO_FALLBACK_SAMPLE);
           } else {
-            // 地区节点不足 20 条 → 全取，再从剩余（非该地区）里随机补足
+            // 地区节点不足抽样数 → 全取，再从剩余（非该地区）里随机补足
             const hitSet = new Set(regionHits);
             const rest = poolItems.filter((x) => !hitSet.has(x));
             sample = regionHits.concat(randomSample(rest, AUTO_FALLBACK_SAMPLE - regionHits.length));
