@@ -2044,7 +2044,7 @@ async function loadConfig(env) {
 const EMPTY_BEST = { runAt: 0, done: 0, items: [], ok: 0, total: 0, regionsKey: "" };
 
 // 定时任务在「池里没有目标地区」时，从全池随机抽这么多条来测（不扫全部，避免子请求超限）
-const AUTO_FALLBACK_SAMPLE = 20;
+const AUTO_FALLBACK_SAMPLE = 40;
 
 // 无偏随机抽样：Fisher-Yates 部分洗牌，不改动原数组
 function randomSample(arr, n) {
@@ -3579,12 +3579,15 @@ export default {
     const domainCode = resolveCountryCode(cfg.domain);
     ctx.waitUntil((async () => {
       const summary = [];
-      for (const type of types) {
+      // 每轮只跑一个协议：游标存在 meta.autoCursor，跑完推进一格，五个协议依次轮转
+      const meta = await kvGet(env, "meta", {});
+      const cursor = types.length ? (parseInt(meta.autoCursor, 10) || 0) % types.length : 0;
+      const nextCursor = types.length ? (cursor + 1) % types.length : 0;
+      for (const type of types.slice(cursor, cursor + 1)) {
         try {
           const poolCount = await fetchAndStore(env, type, cfg);
-          // 定时任务每轮每协议固定测 AUTO_FALLBACK_SAMPLE 条：
-          // 先取 DOMAIN 指定地区的节点，不足抽样数时从全池随机补齐。
-          // 这样既保住地区偏好，又让每轮负载恒定、不会因子请求超限整轮失败。
+          // 本轮协议固定测 AUTO_FALLBACK_SAMPLE 条：先取 DOMAIN 指定地区的节点，
+          // 不足抽样数时从全池随机补齐。这样既保住地区偏好，又把子请求额度集中给单个协议。
           const regions = domainCode ? [domainCode] : [];
           const pool = await kvGet(env, "pool:" + type, { items: [] });
           const poolItems = Array.isArray(pool.items) ? pool.items : [];
@@ -3623,7 +3626,9 @@ export default {
           summary.push(type + ":失败(" + ((e && e.message) || e) + ")");
         }
       }
-      await kvPut(env, "meta", { lastRun: Date.now(), lastAuto: summary, lastAutoAt: Date.now() });
+      await kvPut(env, "meta", Object.assign({}, meta, {
+        lastRun: Date.now(), lastAuto: summary, lastAutoAt: Date.now(), autoCursor: nextCursor,
+      }));
     })());
   },
 };
