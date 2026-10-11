@@ -217,20 +217,24 @@ function internetChecksum(bytes, offset, length) {
 }
 
 // SSTP 要自己拼 IP 包，必须先拿到目标 A 记录
-async function resolveIPv4(host) {
+// 缓存 Promise 而非结果：并发 16 条节点同时开查时只发一次请求，省下 15 张子请求额度
+const IPV4_CACHE = new Map();
+const IPV4_CACHE_MS = 10 * 60 * 1000;
+function resolveIPv4(host) {
   const target = stripIPv6Brackets(host);
-  if (isIPv4(target)) return target;
-  try {
-    const res = await fetch(
-      "https://1.1.1.1/dns-query?name=" + encodeURIComponent(target) + "&type=A",
-      { headers: { accept: "application/dns-json" } },
-    );
-    const data = await res.json();
+  if (isIPv4(target)) return Promise.resolve(target);
+  const hit = IPV4_CACHE.get(target);
+  if (hit && Date.now() - hit.at < IPV4_CACHE_MS) return hit.p;
+  const pending = fetch(
+    "https://1.1.1.1/dns-query?name=" + encodeURIComponent(target) + "&type=A",
+    { headers: { accept: "application/dns-json" } },
+  ).then((res) => res.json()).then((data) => {
     const record = (data.Answer || []).find((item) => item.type === 1 && isIPv4(item.data));
     return record ? record.data : null;
-  } catch (e) {
-    return null;
-  }
+  }).catch(() => null);
+  IPV4_CACHE.set(target, { at: Date.now(), p: pending });
+  pending.then((ip) => { if (!ip) IPV4_CACHE.delete(target); });   // 解析失败不留在缓存里
+  return pending;
 }
 
 // 把地址解析成 { type, host, port, username, password }
@@ -2044,7 +2048,7 @@ async function loadConfig(env) {
 const EMPTY_BEST = { runAt: 0, done: 0, items: [], ok: 0, total: 0, regionsKey: "" };
 
 // 定时任务在「池里没有目标地区」时，从全池随机抽这么多条来测（不扫全部，避免子请求超限）
-const AUTO_FALLBACK_SAMPLE = 40;
+const AUTO_FALLBACK_SAMPLE = 20;
 
 // 无偏随机抽样：Fisher-Yates 部分洗牌，不改动原数组
 function randomSample(arr, n) {
