@@ -2044,7 +2044,7 @@ async function loadConfig(env) {
 const EMPTY_BEST = { runAt: 0, done: 0, items: [], ok: 0, total: 0, regionsKey: "" };
 
 // 定时任务在「池里没有目标地区」时，从全池随机抽这么多条来测（不扫全部，避免子请求超限）
-const AUTO_FALLBACK_SAMPLE = 100;
+const AUTO_FALLBACK_SAMPLE = 20;
 
 // 无偏随机抽样：Fisher-Yates 部分洗牌，不改动原数组
 function randomSample(arr, n) {
@@ -2078,7 +2078,7 @@ async function fetchAndStore(env, type, cfg) {
 }
 
 // 一次调用只测一小批（受 budgetMs 约束），返回进度；面板循环调用直到 finished
-// regionsOverride：定时任务用 DOMAIN 指定的地区，传进来就优先于面板里存的地区选择
+// regionsOverride：传数组（空数组 = 不过滤，测全部）就优先于面板里存的地区选择；不传才读 region:<type>
 async function runChunk(env, type, cfg, restart, regionsOverride) {
   const pool = await kvGet(env, "pool:" + type, { items: [], fetchedAt: 0 });
   const best = await kvGet(env, "best:" + type, EMPTY_BEST);
@@ -2086,7 +2086,7 @@ async function runChunk(env, type, cfg, restart, regionsOverride) {
   if (!all.length) {
     return { type, total: 0, done: 0, finished: true, ok: 0, poolSize: 0, filtered: 0, regions: [], message: "候选池为空，请先拉取候选" };
   }
-  const regions = (regionsOverride && regionsOverride.length) ? regionsOverride : await getRegions(env, type);
+  const regions = Array.isArray(regionsOverride) ? regionsOverride : await getRegions(env, type);
   const items = regions.length ? all.filter((x) => regions.indexOf(pickCountry(x)) !== -1) : all;
   if (!items.length) {
     await kvPut(env, "best:" + type, Object.assign({}, EMPTY_BEST, { regionsKey: regions.join(",") }));
