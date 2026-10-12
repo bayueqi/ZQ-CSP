@@ -3147,7 +3147,7 @@ code{background:#f2f4f7;border:1px solid var(--line2);border-radius:6px;padding:
       var ty = PROTOCOLS[k];
       var tt = STATE.types[ty];
       html += '<div class="ovcard" data-goto="' + ty + '" style="--acc:' + (ACCENT[ty] || '#185FA5') + '" title="点击进入 ' + LABELS[ty] + '">';
-      html += '<div class="ovtop"><b>' + LABELS[ty] + '</b><span class="tag mono">' + ty + '</span></div>';
+      html += '<div class="ovtop"><b>' + LABELS[ty] + '</b></div>';
       html += '<div class="ovnum"><span>可用</span><b>' + tt.ok + '</b></div>';
       html += '<div class="ovsub">候选 ' + tt.poolCount + ' · 已测 ' + tt.done + '/' + tt.total + ' · 最快 ' + fmtMs(tt.fastestMs) + '</div>';
       html += barHtml(tt, 'margin:auto 0 0');
