@@ -89,7 +89,7 @@ const CONTINENT_LABEL = {
   AF: "非洲", OC: "大洋洲", AN: "南极洲", OTHER: "其他",
 };
 const CONTINENT_EMOJI = {
-  AS: "🌏", EU: "🌍", NA: "🌎", SA: "🌎", AF: "🌍", OC: "🌏", AN: "❄️", OTHER: "🌐",
+  AS: "🏯", EU: "🏰", NA: "🗽", SA: "🦜", AF: "🦁", OC: "🦘", AN: "🐧", OTHER: "🌐",
 };
 const CONTINENT_ORDER = ["AS", "EU", "NA", "SA", "AF", "OC", "AN", "OTHER"];
 
@@ -2320,6 +2320,7 @@ function getCookie(request, name) {
 }
 
 const PWD_KEY = "pwd";
+const TOKEN_KEY = "sub_token";   // 订阅令牌（随机串，仅用于读订阅接口）
 
 // 管理密码存在 KV（键 pwd），落盘的是 SHA-256 十六进制，明文不落盘
 async function hashPwd(pwd) {
@@ -2340,20 +2341,53 @@ async function getPwdHash(env) {
   }
 }
 
+// 订阅令牌：存在就返回，没有则用 crypto.randomUUID() 生成一个并写入 KV
+async function ensureToken(env) {
+  try {
+    let tok = await env.CSP.get(TOKEN_KEY);
+    if (tok) return tok;
+    tok = crypto.randomUUID();
+    await env.CSP.put(TOKEN_KEY, tok);
+    return tok;
+  } catch (e) {
+    return crypto.randomUUID(); // 兜底：KV 挂了时至少本次可用
+  }
+}
+
 // 登录 Cookie（值就是密码哈希），30 天有效；HttpOnly，脚本读不到
 function authCookie(hash) {
   return "zq_auth=" + hash + "; Path=/; HttpOnly; Max-Age=2592000; SameSite=Lax";
 }
 
-// 认两种凭证：Cookie zq_auth（值就是密码哈希）或 URL 上的 ?pwd=明文密码
-async function authed(request, env, url) {
+// 管理后台鉴权：仅认 Cookie zq_auth 或 ?pwd= 明文密码 / 密码哈希
+async function adminAuthed(request, env, url) {
+  const cookie = getCookie(request, "zq_auth");
+  if (cookie) {
+    const stored = await getPwdHash(env);
+    if (stored && cookie === stored) return true;
+  }
+  // ?pwd= 认两种值：明文密码（老配置里填的），或密码哈希（老版面板复制的地址）
+  const pwd = url.searchParams.get("pwd");
+  if (!pwd) return false;
   const stored = await getPwdHash(env);
   if (!stored) return false;
+  return pwd === stored || (await hashPwd(pwd)) === stored;
+}
+
+// 订阅接口鉴权：Cookie zq_auth 优先，其次 ?token= 订阅令牌，再其次 ?pwd= 也认订阅令牌（兼容）
+async function subAuthed(request, env, url) {
   const cookie = getCookie(request, "zq_auth");
-  if (cookie && cookie === stored) return true;
-  // ?pwd= 认两种值：明文密码（老配置里填的），或令牌（= 密码哈希，面板复制的地址里带的就是它）
+  if (cookie) {
+    const stored = await getPwdHash(env);
+    if (stored && cookie === stored) return true;
+  }
+  const subToken = await env.CSP.get(TOKEN_KEY);
+  if (!subToken) return false;
+  const tok = url.searchParams.get("token");
+  if (tok && tok === subToken) return true;
+  // 兼容老的 ?pwd=：也认订阅令牌（老地址不至于立刻失效）
   const pwd = url.searchParams.get("pwd");
-  if (pwd && (pwd === stored || (await hashPwd(pwd)) === stored)) return true;
+  if (pwd && pwd === subToken) return true;
   return false;
 }
 
@@ -2379,17 +2413,18 @@ async function handleAdmin(request, env, url) {
     }
     return new Response(null, { status: 302, headers: rHeaders });
   }
-  if (!(await authed(request, env, url))) {
+  if (!(await adminAuthed(request, env, url))) {
     return new Response(loginHtml(), { status: 401, headers: pageHeaders });
   }
   const cfg = await loadConfig(env);
-  return new Response(renderPanel(cfg, stored), { headers: pageHeaders });
+  const subToken = await ensureToken(env);
+  return new Response(renderPanel(cfg, subToken), { headers: pageHeaders });
 }
 
-// 单点检测也要密码（Cookie 或 ?pwd=），免得被陌生人当免费检测器
+// 单点检测需要订阅令牌（Cookie 或 ?token= / ?pwd=），免得被陌生人当免费检测器
 async function handleCheck(request, env, url) {
-  if (!(await authed(request, env, url))) {
-    return json({ error: "未授权：这个地址要带上管理密码，例如 /check?socks5=host:port&pwd=你的密码" }, 401);
+  if (!(await subAuthed(request, env, url))) {
+    return json({ error: "未授权：这个地址要带上订阅令牌，例如 /check?socks5=host:port&token=你的令牌" }, 401);
   }
   const protocol = ["socks5", "http", "https", "sstp", "proxyip"].find((k) => url.searchParams.has(k));
   if (!protocol) return json({ error: "缺少代理参数，用法 /check?socks5=host:port（支持 socks5/http/https/sstp/proxyip）" }, 400);
@@ -2408,13 +2443,13 @@ async function handleCheck(request, env, url) {
   });
 }
 
-// 结果接口：GET /list/<协议|all>（需带 ?pwd=管理密码，或已登录的 Cookie）
+// 结果接口：GET /list/<协议|all>（需带 ?token=订阅令牌 / ?pwd=令牌，或已登录的 Cookie）
 //   默认 text/plain，每行「地址#协议-国家-延迟」
 //   带 ?format=json 时返回 JSON（含协议/地址/延迟/出口IP/国家/机房）
 async function handleList(request, env, url) {
   if (!env.CSP) return textError("未绑定 KV 命名空间（变量名必须填 CSP）");
-  if (!(await authed(request, env, url))) {
-    return new Response("未授权：这个地址要带上管理密码，例如 /list/socks5?pwd=你的密码", {
+  if (!(await subAuthed(request, env, url))) {
+    return new Response("未授权：这个地址要带上订阅令牌，例如 /list/socks5?token=你的令牌", {
       status: 401,
       headers: { "Content-Type": "text/plain;charset=utf-8", "Access-Control-Allow-Origin": "*", "Cache-Control": "no-store" },
     });
@@ -2475,19 +2510,23 @@ async function handleApi(request, env, url, ctx) {
     if (np.length < 4) return json({ error: "密码至少 4 位" }, 400);
     const h = await hashPwd(np);
     await env.CSP.put(PWD_KEY, h);
-    return json({ success: true, token: h }, 200, { "Set-Cookie": authCookie(h) });
+    // 首次设密时同时生成订阅令牌
+    const subToken = crypto.randomUUID();
+    await env.CSP.put(TOKEN_KEY, subToken);
+    return json({ success: true, token: subToken }, 200, { "Set-Cookie": authCookie(h) });
   }
 
-  // 密码登录：校验通过后下发 Cookie，前端随后跳到干净的 /admin，地址栏不留明文密码
+  // 密码登录：校验通过后下发 Cookie，同时确保订阅令牌存在
   if (path === "/api/login") {
     const stored = await getPwdHash(env);
     if (!stored) return json({ error: "还没有设置管理密码" }, 400);
     const pw = String(body.password || "");
     if (!pw || (await hashPwd(pw)) !== stored) return json({ error: "密码错误" }, 401);
-    return json({ success: true, token: stored }, 200, { "Set-Cookie": authCookie(stored) });
+    const subToken = await ensureToken(env);
+    return json({ success: true, token: subToken }, 200, { "Set-Cookie": authCookie(stored) });
   }
 
-  if (!(await authed(request, env, url))) return json({ error: "未授权，请打开 /admin 登录" }, 401);
+  if (!(await adminAuthed(request, env, url))) return json({ error: "未授权，请打开 /admin 登录" }, 401);
   const cfg = await loadConfig(env);
 
   if (path === "/api/state") return json(await buildState(env, cfg));
@@ -2499,7 +2538,19 @@ async function handleApi(request, env, url, ctx) {
     if (np.length < 4) return json({ error: "新密码至少 4 位" }, 400);
     const h = await hashPwd(np);
     await env.CSP.put(PWD_KEY, h);
-    return json({ success: true, token: h }, 200, { "Set-Cookie": authCookie(h) });
+    // 改密码不影响订阅令牌，返回当前 token（便于前端同步）
+    const subToken = await ensureToken(env);
+    return json({ success: true, token: subToken }, 200, { "Set-Cookie": authCookie(h) });
+  }
+
+  // 订阅令牌：查看或重新生成
+  if (path === "/api/token") {
+    if (body.action === "regenerate") {
+      const newToken = crypto.randomUUID();
+      await env.CSP.put(TOKEN_KEY, newToken);
+      return json({ success: true, token: newToken });
+    }
+    return json({ success: true, token: (await env.CSP.get(TOKEN_KEY)) || "" });
   }
 
   if (path === "/api/config") {
@@ -2649,9 +2700,9 @@ function setupHtml() {
   return authPage(form, script);
 }
 
-function renderPanel(cfg, token) {
+function renderPanel(cfg, subToken) {
   const initial = JSON.stringify({
-    token: token || "",
+    subToken: subToken || "",
     protocols: PROTOCOLS,
     labels: TYPE_LABEL,
     continents: CONTINENT_LABEL,
@@ -2893,6 +2944,11 @@ code{background:#f2f4f7;border:1px solid var(--line2);border-radius:6px;padding:
     <label class="f">定时优选地区<input type="text" id="cfgDomain" placeholder="香港"></label>
     <label class="f">并发数（1–32）<input type="number" id="cfgConcurrency" min="1" max="32"></label>
     <label class="f">超时时间 ms<input type="number" id="cfgTimeoutMs" min="1000" max="120000" step="500"></label>
+    <div class="hint" style="margin-top:12px">订阅令牌（用于 /list/* 和 /check 接口，可与他人分享，<b>不能登录后台</b>）</div>
+    <div class="row" style="gap:6px">
+      <code id="cfgToken" class="apiv" style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;cursor:pointer" title="点击复制"></code>
+      <button class="sm ghost" id="btnRegenToken" style="flex:none">重新生成</button>
+    </div>
     <div class="row" style="justify-content:flex-end;margin-top:16px">
       <button id="btnSettingsCancel">取消</button>
       <button class="primary" id="btnSettingsSave">保存</button>
@@ -2903,8 +2959,8 @@ code{background:#f2f4f7;border:1px solid var(--line2);border-radius:6px;padding:
 <script>
 (function(){
   var BOOT = ${initial};
-  // 凭据令牌：由服务端在渲染本页时注入（值就是密码哈希，与登录 Cookie 同源）
-  var PWD = BOOT.token || '';
+  // 订阅令牌：由服务端在渲染本页时注入（随机生成，仅用于读订阅接口，不是管理密码）
+  var SUB_TOKEN = BOOT.subToken || '';
   var PROTOCOLS = BOOT.protocols;
   var LABELS = BOOT.labels;
   var STATE = null;
@@ -2952,7 +3008,7 @@ code{background:#f2f4f7;border:1px solid var(--line2);border-radius:6px;padding:
     box.textContent = text;
   }
   function api(path, body){
-    var url = path + (path.indexOf('?') >= 0 ? '&' : '?') + 'pwd=' + encodeURIComponent(PWD);
+    var url = path + '?token=' + encodeURIComponent(SUB_TOKEN);
     return fetch(url, {
       method: body ? 'POST' : 'GET',
       headers: body ? { 'Content-Type': 'application/json' } : {},
@@ -2994,7 +3050,7 @@ code{background:#f2f4f7;border:1px solid var(--line2);border-radius:6px;padding:
     toastTimer = setTimeout(function(){ node.className = 'toast'; }, 1800);
   }
 
-  function apiUrl(type){ return location.origin + '/list/' + type + (PWD ? '?pwd=' + encodeURIComponent(PWD) : ''); }
+  function apiUrl(type){ return location.origin + '/list/' + type + (SUB_TOKEN ? '?token=' + encodeURIComponent(SUB_TOKEN) : ''); }
 
   function apiBox(type){
     var u = apiUrl(type);
@@ -3010,9 +3066,20 @@ code{background:#f2f4f7;border:1px solid var(--line2);border-radius:6px;padding:
     el('cfgDomain').value = c.domain || '';
     el('cfgConcurrency').value = c.concurrency;
     el('cfgTimeoutMs').value = c.timeoutMs;
+    el('cfgToken').textContent = SUB_TOKEN || '（未生成）';
     el('mSettings').classList.add('open');
   }
   function closeSettings(){ el('mSettings').classList.remove('open'); }
+
+  // 重新生成订阅令牌
+  function regenToken(){
+    if(!confirm('重新生成后，旧的订阅地址会立即失效，确定吗？')) return;
+    api('/api/token', { action: 'regenerate' }).then(function(r){
+      SUB_TOKEN = r.token;
+      el('cfgToken').textContent = SUB_TOKEN;
+      log('订阅令牌已更新，旧令牌已失效');
+    }).catch(function(e){ log('操作失败：' + e.message); });
+  }
 
   function saveSettings(){
     var newPwd = (el('cfgPwd').value || '').trim();
@@ -3028,7 +3095,7 @@ code{background:#f2f4f7;border:1px solid var(--line2);border-radius:6px;padding:
       if(newPwd.length < 4){ log('新密码至少 4 位，密码未修改'); closeSettings(); return; }
       return api('/api/pwd', { newPwd: newPwd }).then(function(p){
         // 服务端已换新令牌，这里同步内存里的值，改密后面板上的地址立刻可用
-        if(p.token) PWD = p.token;
+        if(p.token) SUB_TOKEN = p.token;
         log('管理密码已更新');
         closeSettings();
       });
@@ -3535,6 +3602,15 @@ code{background:#f2f4f7;border:1px solid var(--line2);border-radius:6px;padding:
   bind('btnSettings', openSettings);
   bind('btnSettingsCancel', closeSettings);
   bind('btnSettingsSave', saveSettings);
+  bind('btnRegenToken', regenToken);
+  // 点击令牌区域复制
+  (function(){
+    var node = el('cfgToken');
+    if(node) node.addEventListener('click', function(){
+      var t = (SUB_TOKEN || '').trim();
+      if(t) copyText(t);
+    });
+  })();
   bind('btnClearLog', function(){
     var key = PROTOCOLS.indexOf(ACTIVE) !== -1 ? ACTIVE : '';
     if(key) LOGS[key] = [];
