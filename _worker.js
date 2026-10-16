@@ -17,6 +17,7 @@ const DEFAULT_CONFIG = {
   domain: "香港",            // 定时任务默认优选的地区（可填国家中文名或两位国家码，如 香港 / HK）
   concurrency: 16,
   timeoutMs: 10000,
+  autoSample: 20,           // 定时任务每轮自动优选的抽样数量
   budgetMs: 5000,           // 单次 /api/optimize 调用的时间片（内部固定值，不在面板中暴露）
                             // 这个值也是「暂停优选」的响应上限：点暂停后，当前这一片跑完才会停
   autoTypes: ["socks5", "http", "https", "sstp", "proxyip"],
@@ -2024,6 +2025,7 @@ function normalizeConfig(raw) {
   cfg.domain = String(cfg.domain === undefined || cfg.domain === null ? "" : cfg.domain).trim() || DEFAULT_CONFIG.domain;
   cfg.concurrency = Math.max(1, Math.min(32, parseInt(cfg.concurrency, 10) || DEFAULT_CONFIG.concurrency));
   cfg.timeoutMs = Math.max(1000, Math.min(120000, parseInt(cfg.timeoutMs, 10) || DEFAULT_CONFIG.timeoutMs));
+  cfg.autoSample = Math.max(1, Math.min(500, parseInt(cfg.autoSample, 10) || DEFAULT_CONFIG.autoSample));
   cfg.budgetMs = DEFAULT_CONFIG.budgetMs;   // 固定值，不接受 KV 里的旧配置覆盖
   delete cfg.maxPool;
   delete cfg.maxPerType;
@@ -2046,9 +2048,6 @@ async function loadConfig(env) {
 }
 
 const EMPTY_BEST = { runAt: 0, done: 0, items: [], ok: 0, total: 0, regionsKey: "" };
-
-// 定时任务在「池里没有目标地区」时，从全池随机抽这么多条来测（不扫全部，避免子请求超限）
-const AUTO_FALLBACK_SAMPLE = 20;
 
 // 无偏随机抽样：Fisher-Yates 部分洗牌，不改动原数组
 function randomSample(arr, n) {
@@ -2944,6 +2943,7 @@ code{background:#f2f4f7;border:1px solid var(--line2);border-radius:6px;padding:
     <label class="f">定时优选地区<input type="text" id="cfgDomain" placeholder="香港"></label>
     <label class="f">并发数（1–32）<input type="number" id="cfgConcurrency" min="1" max="32"></label>
     <label class="f">超时时间 ms<input type="number" id="cfgTimeoutMs" min="1000" max="120000" step="500"></label>
+    <label class="f">自动优选数量<input type="number" id="cfgAutoSample" min="1" max="500"></label>
     <div class="hint" style="margin-top:12px">订阅令牌（用于 /list/* 和 /check 接口，可与他人分享，<b>不能登录后台</b>）</div>
     <div class="row" style="gap:6px">
       <code id="cfgToken" class="apiv" style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;cursor:pointer" title="点击复制"></code>
@@ -3066,6 +3066,7 @@ code{background:#f2f4f7;border:1px solid var(--line2);border-radius:6px;padding:
     el('cfgDomain').value = c.domain || '';
     el('cfgConcurrency').value = c.concurrency;
     el('cfgTimeoutMs').value = c.timeoutMs;
+    el('cfgAutoSample').value = c.autoSample;
     el('cfgToken').textContent = SUB_TOKEN || '（未生成）';
     el('mSettings').classList.add('open');
   }
@@ -3086,7 +3087,8 @@ code{background:#f2f4f7;border:1px solid var(--line2);border-radius:6px;padding:
     var cfg = {
       domain: el('cfgDomain').value.trim(),
       concurrency: parseInt(el('cfgConcurrency').value, 10),
-      timeoutMs: parseInt(el('cfgTimeoutMs').value, 10)
+      timeoutMs: parseInt(el('cfgTimeoutMs').value, 10),
+      autoSample: parseInt(el('cfgAutoSample').value, 10)
     };
     api('/api/config', { config: cfg }).then(function(r){
       STATE.config = r.config;
@@ -3666,8 +3668,9 @@ export default {
       for (const type of types.slice(cursor, cursor + 1)) {
         try {
           const poolCount = await fetchAndStore(env, type, cfg);
-          // 本轮协议固定测 AUTO_FALLBACK_SAMPLE 条：先取 DOMAIN 指定地区的节点，
+          // 本轮协议固定测 autoSample 条：先取 DOMAIN 指定地区的节点，
           // 不足抽样数时从全池随机补齐。这样既保住地区偏好，又把子请求额度集中给单个协议。
+          const sampleCount = cfg.autoSample;
           const regions = domainCode ? [domainCode] : [];
           const pool = await kvGet(env, "pool:" + type, { items: [] });
           const poolItems = Array.isArray(pool.items) ? pool.items : [];
@@ -3679,13 +3682,13 @@ export default {
             ? poolItems.filter((x) => pickCountry(x) === domainCode)
             : poolItems;
           let sample;
-          if (regionHits.length >= AUTO_FALLBACK_SAMPLE) {
-            sample = randomSample(regionHits, AUTO_FALLBACK_SAMPLE);
+          if (regionHits.length >= sampleCount) {
+            sample = randomSample(regionHits, sampleCount);
           } else {
             // 地区节点不足抽样数 → 全取，再从剩余（非该地区）里随机补足
             const hitSet = new Set(regionHits);
             const rest = poolItems.filter((x) => !hitSet.has(x));
-            sample = regionHits.concat(randomSample(rest, AUTO_FALLBACK_SAMPLE - regionHits.length));
+            sample = regionHits.concat(randomSample(rest, sampleCount - regionHits.length));
           }
           await kvPut(env, "pool:" + type, Object.assign({}, pool, { items: sample }));
           regions.length = 0;   // 已自行抽样，runChunk 不再按地区过滤
