@@ -2632,7 +2632,10 @@ button:hover{background:#134d87}
 `;
 
 // 站点图标（内联 SVG，不额外占用路由）；登录页与管理面板共用同一份
-const FAVICON_LINK = "<link rel=\"icon\" type=\"image/svg+xml\" href=\"data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><circle cx='13' cy='13' r='8.5' fill='none' stroke='%23185FA5' stroke-width='3'/><path d='M20 20 27.2 27.2' stroke='%23185FA5' stroke-width='3.4' stroke-linecap='round'/><text x='13' y='16.9' font-family='sans-serif' font-size='11' font-weight='800' fill='%23185FA5' text-anchor='middle'>IP</text></svg>\">";
+// 站点图标：同源提供。原来只是内联 data: URI，抓取类工具（HtmlIco 等）和部分浏览器拿不到，
+// 现在多给一条 /favicon.svg 公开路由，页面也指向它。图形与原来完全一致。
+const ICON_SVG = "<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><circle cx='13' cy='13' r='8.5' fill='none' stroke='#185FA5' stroke-width='3'/><path d='M20 20 27.2 27.2' stroke='#185FA5' stroke-width='3.4' stroke-linecap='round'/><text x='13' y='16.9' font-family='sans-serif' font-size='11' font-weight='800' fill='#185FA5' text-anchor='middle'>IP</text></svg>";
+const FAVICON_LINK = "<link rel=\"icon\" type=\"image/svg+xml\" href=\"/favicon.svg\">";
 
 function authPage(inner, script) {
   return `<!DOCTYPE html>
@@ -3640,6 +3643,14 @@ export default {
     const url = new URL(request.url);
     const path = url.pathname;
     try {
+      if (path === "/favicon.svg") {
+        return new Response(ICON_SVG, {
+          headers: {
+            "content-type": "image/svg+xml; charset=UTF-8",
+            "cache-control": "public, max-age=604800",
+          },
+        });
+      }
       if (path === "/") return Response.redirect(url.origin + "/admin", 302);
       if (path === "/admin" || path === "/admin/") return await handleAdmin(request, env, url);
       if (path === "/health") return json({ ok: true, time: Date.now() });
