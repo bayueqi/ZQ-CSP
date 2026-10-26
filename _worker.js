@@ -4254,10 +4254,17 @@ code{background:#f2f4f7;border:1px solid var(--line2);border-radius:6px;padding:
     return api('/api/state').then(function(s){
       STATE = s;
       if(quiet) return;
-      // 正在输入参数时不要整页重绘：重绘会把输入框换成新节点，光标和还没提交的值都会丢
+      // 正在输入参数时不要整页重绘：重绘会把输入框换成新节点，光标和还没提交的值都会丢。
+      // 单选/复选不算输入（选地区就靠它），必须重绘，否则顶部「地区：X」不会跟着变
       var a = document.activeElement;
-      if(a && /^(INPUT|SELECT|TEXTAREA)$/.test(a.tagName)) return;
+      if(a && (a.tagName === 'TEXTAREA' || a.tagName === 'SELECT' || a.isContentEditable)) return;
+      if(a && a.tagName === 'INPUT' && /^(text|number|search|email|password|tel|url)$/i.test(a.type || 'text')) return;
+      // 重绘会把地区面板的滚动位置带回顶部，先记下来再还原
+      var rs = document.querySelector('.regscroll');
+      var keepTop = rs ? rs.scrollTop : 0;
       render();
+      var rs2 = document.querySelector('.regscroll');
+      if(rs2 && keepTop) rs2.scrollTop = keepTop;
     }).catch(function(e){
       log('加载状态失败：' + e.message);
       // 首屏还没成功过就别把用户永远留在「加载中…」
