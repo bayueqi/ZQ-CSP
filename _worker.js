@@ -11,22 +11,128 @@ const DEFAULT_SOURCES = {
   proxyip: "https://zip.cm.edu.kg.cmliussss.net/all.json",
   vpngate: "http://www.vpngate.net/api/iphone/",
   vpngateMirror: "https://raw.githubusercontent.com/fdciabdul/Vpngate-Scraper-API/main/json/data.json",
+  // 优选域名的候选名单：CF-Pages-BestCF 的 cf_domains.txt，一行一个挂在 CF 上的域名
+  cfDomains: "https://raw.githubusercontent.com/cmliu/CF-Pages-BestCF/main/cf_domains.txt",
+};
+
+// 优选IP 的候选段表，与 CF-Pages-BestCF 的 IP 库下拉一一对应
+const CF_LIBRARIES = {
+  "cf-v4": { label: "CF官方列表v4", url: "https://api.check.proxyip.cmliussss.net/ips-v4" },
+  "cf-v6": { label: "CF官方列表v6", url: "https://api.check.proxyip.cmliussss.net/ips-v6" },
+  "cm-v4": { label: "CM优选列表v4", url: "https://raw.githubusercontent.com/cmliu/cmliu/main/CF-CIDR.txt" },
+  "as13335-v4": { label: "AS13335列表v4", url: "https://raw.githubusercontent.com/ipverse/asn-ip/master/as/13335/ipv4-aggregated.txt" },
+  "as13335-v6": { label: "AS13335列表v6", url: "https://raw.githubusercontent.com/ipverse/asn-ip/master/as/13335/ipv6-aggregated.txt" },
+  "as209242-v4": { label: "AS209242列表v4", url: "https://raw.githubusercontent.com/ipverse/asn-ip/master/as/209242/ipv4-aggregated.txt" },
+  "as209242-v6": { label: "AS209242列表v6", url: "https://raw.githubusercontent.com/ipverse/asn-ip/master/as/209242/ipv6-aggregated.txt" },
+};
+
+// 面板上能改的候选来源。优选IP 一份段表一行，各自采样；优选域名的名单合并去重；
+// 其余五类是一份代理名单，填多行就是多份镜像，拉到的节点合并去重。
+// key 只用来在池子里标记候选来自哪一行，改地址时保持不变，删掉整行才消失。
+const CF_SOURCES_DEFAULT = {
+  socks5: [{ key: "socks5", label: "EDT Proxy-List", url: DEFAULT_SOURCES.socks5 }],
+  http: [{ key: "http", label: "EDT Proxy-List", url: DEFAULT_SOURCES.http }],
+  https: [{ key: "https", label: "EDT Proxy-List", url: DEFAULT_SOURCES.https }],
+  // VPN Gate 官方源是 CSV、镜像是 JSON，两行都拉、合并去重，和上面几类一样
+  sstp: [
+    { key: "vpngate", label: "VPN Gate 官方源", url: DEFAULT_SOURCES.vpngate },
+    { key: "vpngate-mirror", label: "VPN Gate 镜像", url: DEFAULT_SOURCES.vpngateMirror },
+  ],
+  proxyip: [{ key: "proxyip", label: "ProxyIP 汇总", url: DEFAULT_SOURCES.proxyip }],
+  cfip: Object.keys(CF_LIBRARIES).map((k) => ({
+    key: k,
+    label: CF_LIBRARIES[k].label,
+    url: CF_LIBRARIES[k].url,
+  })),
+  cfdomain: [{
+    key: "cf-domains",
+    label: "CF-Pages 域名名单",
+    url: DEFAULT_SOURCES.cfDomains,
+  }],
+};
+
+// 来源列表归一化：只认 http(s) 地址，key 缺失或重名就编号，最多 20 行，全删光回落默认
+function sanitizeCfSources(raw) {
+  const out = {};
+  for (const t of Object.keys(CF_SOURCES_DEFAULT)) {
+    const list = Array.isArray(raw && raw[t]) ? raw[t] : [];
+    const rows = [];
+    const used = new Set();
+    for (const one of list) {
+      if (!one || typeof one !== "object") continue;
+      const url = String(one.url || "").trim().slice(0, 400);
+      if (!/^https?:\/\/[^\s]+$/i.test(url)) continue;
+      let key = String(one.key || "").trim().replace(/[^\w.-]/g, "").slice(0, 40);
+      if (!key || used.has(key)) {
+        let n = rows.length + 1;
+        while (used.has("src-" + n)) n++;
+        key = "src-" + n;
+      }
+      used.add(key);
+      const label = String(one.label || "").trim().slice(0, 26) || url.replace(/^https?:\/\//i, "").split("/")[0];
+      rows.push({ key, label, url });
+      if (rows.length >= 20) break;
+    }
+    out[t] = rows.length ? rows : CF_SOURCES_DEFAULT[t].map((x) => Object.assign({}, x));
+  }
+  return out;
+}
+
+// 每份段表一次拉取多少条候选，面板上按类型可改（默认值与 CF-Pages-BestCF 的 CANDIDATE_LIMIT 一致）
+const CF_CANDIDATE_LIMIT = 512;
+const CF_DEFAULT_PORT = 443;
+
+// 这两类必须在浏览器里测（量的是本机到目标），走不了 Worker 的 runChunk
+const CF_TYPES = ["cfip", "cfdomain"];
+
+
+// 每类协议各自的并发 / 超时 / 定时抽样数（面板上按类型调，设置里不再放全局值）
+// 优选IP、优选域名这两类量的是「打到 CF 边缘的往返」，超时与 BestCF 的默认值保持一致（500ms）：
+// 超时只决定多久没响应算失败，不参与延迟计算
+const TYPE_DEFAULTS = {
+  socks5: { concurrency: 16, timeoutMs: 10000, autoSample: 20, pullCount: CF_CANDIDATE_LIMIT },
+  http: { concurrency: 16, timeoutMs: 10000, autoSample: 20, pullCount: CF_CANDIDATE_LIMIT },
+  https: { concurrency: 16, timeoutMs: 10000, autoSample: 20, pullCount: CF_CANDIDATE_LIMIT },
+  sstp: { concurrency: 16, timeoutMs: 10000, autoSample: 20, pullCount: CF_CANDIDATE_LIMIT },
+  proxyip: { concurrency: 16, timeoutMs: 10000, autoSample: 20, pullCount: CF_CANDIDATE_LIMIT },
+  cfip: { concurrency: 16, timeoutMs: 500, autoSample: 20, pullCount: CF_CANDIDATE_LIMIT },
+  cfdomain: { concurrency: 16, timeoutMs: 500, autoSample: 20, pullCount: CF_CANDIDATE_LIMIT },
 };
 
 const DEFAULT_CONFIG = {
-  domain: "香港",            // 定时任务默认优选的地区（可填国家中文名或两位国家码，如 香港 / HK）
-  concurrency: 16,
-  timeoutMs: 10000,
-  autoSample: 20,           // 定时任务每轮自动优选的抽样数量
   budgetMs: 5000,           // 单次 /api/optimize 调用的时间片（内部固定值，不在面板中暴露）
                             // 这个值也是「暂停优选」的响应上限：点暂停后，当前这一片跑完才会停
-  autoTypes: ["socks5", "http", "https", "sstp", "proxyip"],
+  autoTypes: ["socks5", "http", "https", "sstp", "proxyip", "cfip", "cfdomain"],
   sources: DEFAULT_SOURCES,
+  cfSources: CF_SOURCES_DEFAULT,   // 候选来源（七类各一组），面板上可增删改
+  libSel: {},               // 每类协议这一轮测哪一份来源（normalizeConfig 按 cfSources 补齐）
+  typeCfg: TYPE_DEFAULTS,   // 每类协议自己的并发 / 超时 / 定时抽样数
 };
 
-const PROTOCOLS = ["socks5", "http", "https", "sstp", "proxyip"];
-const TYPE_LABEL = {
+// 取某一类协议自己的设置；配置里缺字段时回落到该类型的默认值
+function typeCfgOf(cfg, type) {
+  const def = TYPE_DEFAULTS[type] || TYPE_DEFAULTS.socks5;
+  const all = (cfg && cfg.typeCfg) || {};
+  const one = all[type] || {};
+  return {
+    concurrency: parseInt(one.concurrency, 10) || def.concurrency,
+    timeoutMs: parseInt(one.timeoutMs, 10) || def.timeoutMs,
+    autoSample: parseInt(one.autoSample, 10) || def.autoSample,
+    pullCount: parseInt(one.pullCount, 10) || def.pullCount,
+  };
+}
+
+// 某一类这一轮测哪一份来源（cfSources[type] 里的 key）；配置里没记就取第一份
+function libSelOf(cfg, type) {
+  const sel = (cfg && cfg.libSel) || {};
+  if (sel[type]) return sel[type];
+  const rows = (cfg && cfg.cfSources && cfg.cfSources[type]) || [];
+  return rows.length ? rows[0].key : "";
+}
+
+const PROTOCOLS = ["socks5", "http", "https", "sstp", "proxyip", "cfip", "cfdomain"];const TYPE_LABEL = {
   socks5: "SOCKS5", http: "HTTP", https: "HTTPS", sstp: "SSTP", proxyip: "ProxyIP",
+  cfip: "CF IP", cfdomain: "CF 域名",
 };
 
 // 检测目标：返回 ip= / loc= / colo=，一次拿到出口 IP、地区、命中的 CF 机房
@@ -82,6 +188,57 @@ const COUNTRY_ZH = {
   VA: "梵蒂冈", VC: "圣文森特和格林纳丁斯", VE: "委内瑞拉", VG: "英属维尔京群岛",
   VI: "美属维尔京群岛", VN: "越南", VU: "瓦努阿图", WF: "瓦利斯和富图纳", WS: "萨摩亚",
   YE: "也门", YT: "马约特", ZA: "南非", ZM: "赞比亚", ZW: "津巴布韦",
+};
+
+// Cloudflare 机房三字码 → 所在国家/地区代码（优选的 IP、域名只能拿到 trace 里的 colo，
+// 国家就从这里查；查不到的国家码为空，界面回落成直接显示三字码）
+const CF_COLO_CC = {
+  AAE:"DZ", ABJ:"CI", ABQ:"US", ACC:"GH", ACX:"CN", ADB:"TR", ADD:"ET", ADL:"AU",
+  AGR:"IN", AIP:"IN", AKL:"NZ", AKX:"KZ", ALA:"KZ", ALG:"DZ", AMD:"IN", AMM:"JO",
+  AMS:"NL", ANC:"US", ARI:"CL", ARN:"SE", ARU:"BR", ASK:"CI", ASU:"PY", ATH:"GR",
+  ATL:"US", AUS:"US", AVA:"CN", BAH:"BH", BAQ:"CO", BBI:"IN", BCN:"ES", BDQ:"IN",
+  BEG:"RS", BEL:"BR", BEY:"LB", BGI:"BB", BGR:"US", BGW:"IQ", BHY:"CN", BKK:"TH",
+  BLR:"IN", BNA:"US", BNE:"AU", BNU:"BR", BOD:"FR", BOG:"CO", BOM:"IN", BOS:"US",
+  BRU:"BE", BSB:"BR", BSR:"IQ", BTS:"SK", BUD:"HU", BUF:"US", BWN:"BN", CAI:"EG",
+  CAN:"CN", CAW:"BR", CBR:"AU", CCP:"CL", CCU:"IN", CDG:"FR", CEB:"PH", CFC:"BR",
+  CGB:"BR", CGD:"CN", CGK:"ID", CGO:"CN", CGP:"BD", CGY:"PH", CHC:"NZ", CJB:"IN",
+  CKG:"CN", CLE:"US", CLO:"CO", CLT:"US", CMB:"LK", CMH:"US", CNF:"BR", CNN:"IN",
+  CNX:"TH", COK:"IN", COR:"AR", CPH:"DK", CPT:"ZA", CRK:"PH", CSX:"CN", CTU:"CN",
+  CVG:"US", CWB:"BR", CZL:"DZ", CZX:"CN", DAC:"BD", DAD:"VN", DAR:"TZ", DEL:"IN",
+  DEN:"US", DFW:"US", DKR:"SN", DLA:"CM", DLC:"CN", DME:"RU", DMM:"SA", DOH:"QA",
+  DPS:"ID", DTW:"US", DUB:"IE", DUR:"ZA", DUS:"DE", DXB:"AE", DYU:"TJ", EBB:"UG",
+  EBL:"IQ", EDI:"GB", EVN:"AM", EWR:"US", EZE:"AR", FCO:"IT", FIH:"CD", FLN:"BR",
+  FOC:"CN", FOR:"BR", FRA:"DE", FRU:"KG", FSD:"US", FUK:"JP", FUO:"CN", GBE:"BW",
+  GDL:"MX", GEO:"GY", GIG:"BR", GND:"GD", GOT:"SE", GRU:"BR", GUA:"GT", GUM:"GU",
+  GVA:"CH", GYD:"AZ", GYE:"EC", GYN:"BR", HAK:"CN", HAM:"DE", HAN:"VN", HBA:"AU",
+  HEL:"FI", HFA:"IL", HFE:"CN", HGH:"CN", HKG:"HK", HNL:"US", HRE:"ZW", HYD:"IN",
+  HYN:"CN", IAD:"US", IAH:"US", ICN:"KR", IND:"US", ISB:"PK", IST:"TR", ISU:"IQ",
+  ITJ:"BR", IXC:"IN", JAX:"US", JDO:"BR", JED:"SA", JHB:"MY", JIB:"DJ", JNB:"ZA",
+  JOG:"ID", JOI:"BR", JRG:"IN", JSR:"BD", JXG:"CN", KBP:"UA", KCH:"MY", KEF:"IS",
+  KGL:"RW", KHH:"TW", KHI:"PK", KHN:"CN", KIN:"JM", KIV:"MD", KIX:"JP", KJA:"RU",
+  KMG:"CN", KNU:"IN", KTM:"NP", KUL:"MY", KWE:"CN", KWI:"KW", LAD:"AO", LAS:"US",
+  LAX:"US", LCA:"CY", LED:"RU", LHE:"PK", LHR:"GB", LHW:"CN", LIM:"PE", LIS:"PT",
+  LJU:"SI", LLK:"AZ", LLW:"MW", LOS:"NG", LPB:"BO", LUH:"IN", LUN:"ZM", LUX:"LU",
+  LYA:"CN", LYS:"FR", MAA:"IN", MAD:"ES", MAN:"GB", MAO:"BR", MBA:"KE", MCI:"US",
+  MCT:"OM", MDE:"CO", MEL:"AU", MEM:"US", MEX:"MX", MFE:"US", MFM:"MO", MIA:"US",
+  MLA:"MT", MLE:"MV", MLG:"ID", MNL:"PH", MPM:"MZ", MRS:"FR", MRU:"MU", MSP:"US",
+  MSQ:"BY", MUC:"DE", MXP:"IT", NAG:"IN", NBO:"KE", NJF:"IQ", NNG:"CN", NOU:"NC",
+  NQN:"AR", NQZ:"KZ", NRT:"JP", NVT:"BR", OKA:"JP", OKC:"US", OMA:"US", ORD:"US",
+  ORF:"US", ORK:"IE", ORN:"DZ", OSL:"NO", OTP:"RO", OUA:"BF", PAT:"IN", PBH:"BT",
+  PBM:"SR", PDX:"US", PER:"AU", PHL:"US", PHX:"US", PIT:"US", PKX:"CN", PMO:"IT",
+  PMW:"BR", PNH:"KH", PNQ:"IN", POA:"BR", POS:"TT", PPT:"PF", PRG:"CZ", PRN:"XK",
+  PTY:"PA", QRO:"MX", QWJ:"BR", RAO:"BR", RDU:"US", REC:"BR", RIC:"US", RIX:"LV",
+  RUH:"SA", RUN:"RE", SAN:"US", SAP:"HN", SAT:"US", SCL:"CL", SDQ:"DO", SEA:"US",
+  SFO:"US", SGN:"VN", SHA:"CN", SIN:"SG", SJC:"US", SJK:"BR", SJO:"CR", SJP:"BR",
+  SJU:"PR", SJW:"CN", SKG:"GR", SKP:"MK", SLC:"US", SMF:"US", SOD:"BR", SOF:"BG",
+  SSA:"BR", STI:"DO", STL:"US", STR:"DE", SUV:"FJ", SVX:"RU", SYD:"AU", SZX:"CN",
+  TAO:"CN", TAS:"UZ", TBS:"GE", TEN:"CN", TGU:"HN", TIA:"AL", TLH:"US", TLL:"EE",
+  TLV:"IL", TNA:"CN", TNR:"MG", TPA:"US", TPE:"TW", TSN:"CN", TUN:"TN", TXL:"DE",
+  TYN:"CN", UDI:"BR", UDR:"IN", UIO:"EC", ULN:"MN", URT:"TH", VCP:"BR", VIE:"AT",
+  VIX:"BR", VNO:"LT", VTE:"LA", WAW:"PL", WDH:"NA", WHU:"CN", WLG:"NZ", WRO:"PL",
+  XAP:"BR", XFN:"CN", XIY:"CN", XNH:"IQ", XNN:"CN", YHZ:"CA", YOW:"CA", YUL:"CA",
+  YVR:"CA", YWG:"CA", YXE:"CA", YYC:"CA", YYZ:"CA", ZAG:"HR", ZDM:"PS", ZGN:"CN",
+  ZRH:"CH",
 };
 
 // 大洲分组，用的就是数据源那套标准大洲码（元数据里 continent 字段的值）
@@ -1755,11 +1912,75 @@ async function checkProxyIp(address, timeoutMs) {
 // 单点检测：返回 { ok, latency, exitIp, country, colo, error }
 // 与 edgetunnel / CF-Workers-CheckSocks5 一致：先把隧道建到目标站点，再在隧道里做 TLS + HTTP 请求，
 // 只有拿到真实出口 IP 才算出活；延迟取「建隧道 → 读完响应」的整段耗时
+// 优选IP：直连候选地址，TLS 的 SNI 固定用 TRACE_HOST
+// 浏览器对 IP 字面量不发 SNI，握手一定失败，所以这一路只能放到 Worker 里测
+async function checkCfIp(address, timeoutMs, samples) {
+  const text = String(address || "").trim();
+  let host = "";
+  let port = CF_DEFAULT_PORT;
+  const bracketed = /^\[(.+)]:(\d{1,5})$/.exec(text);
+  if (bracketed) {
+    host = bracketed[1];
+    port = parseInt(bracketed[2], 10);
+  } else {
+    const pos = text.lastIndexOf(":");
+    if (pos > 0 && /^\d{1,5}$/.test(text.slice(pos + 1))) {
+      host = text.slice(0, pos);
+      port = parseInt(text.slice(pos + 1), 10);
+    } else {
+      host = text;
+    }
+  }
+  if (!host) return { ok: false, latency: 0, error: "地址格式无效" };
+
+  // 与优选域名同一条测法：串行测多次取最小值（单点测试传 3，批量优选仍只测 1 次）
+  const times = Math.max(1, Math.min(5, parseInt(samples, 10) || 1));
+  const samplesMs = [];
+  let lastError = null;
+  let lastMs = 0;
+  let info = null;
+  for (let i = 0; i < times; i++) {
+    const started = Date.now();
+    let socket = null;
+    try {
+      socket = connect({ hostname: host, port });
+      await withTimeout(socket.opened, timeoutMs, "TCP 连接超时");
+      const body = await tlsGetOverSocket(socket, TRACE_HOST, TRACE_PORT, TRACE_PATH, timeoutMs);
+      const parsed = parseTrace(body);
+      if (!parsed.colo) throw new Error("没有返回 Cloudflare trace");
+      samplesMs.push(Math.max(1, Date.now() - started));
+      info = parsed;
+    } catch (error) {
+      lastError = error;
+      lastMs = Date.now() - started;
+    } finally {
+      try { socket && socket.close && socket.close(); } catch (e) {}
+    }
+  }
+  if (!samplesMs.length) {
+    return { ok: false, latency: lastMs, error: String((lastError && lastError.message) || lastError || "检测失败") };
+  }
+  return {
+    ok: true,
+    latency: Math.min.apply(null, samplesMs),
+    exitIp: host,
+    country: info.loc || "",
+    colo: info.colo,
+  };
+}
+
 async function runCheck(type, address, opts) {
   const options = opts || {};
-  const timeoutMs = options.timeoutMs || DEFAULT_CONFIG.timeoutMs;
+  const timeoutMs = options.timeoutMs || typeCfgOf(options, type).timeoutMs;
   const started = Date.now();
   if (type === "proxyip") return await checkProxyIp(address, timeoutMs);
+  if (type === "cfip") return await checkCfIp(address, timeoutMs, options.samples);
+  // 优选域名在 Worker 里测：直连候选的 443 拿 cdn-cgi/trace，量的是机房到目标的往返，
+  // 与面板上用浏览器测的口径不同（定时任务用它，够用来筛掉完全不通的域名）
+  if (type === "cfdomain") {
+    const r = await checkCfIp(address, timeoutMs, options.samples);
+    return Object.assign({}, r, { exitIp: "" });
+  }
 
   let socket = null;
   try {
@@ -1975,27 +2196,290 @@ function parseProxyIpList(data) {
   return out;
 }
 
-async function fetchCandidates(type, cfg) {
-  const sources = Object.assign({}, DEFAULT_SOURCES, cfg.sources || {});
-  if (type === "sstp") {
-    try {
-      const res = await fetchWithTimeout(sources.vpngate, 30000, { headers: { "User-Agent": "Mozilla/5.0 (compatible; proxy-optimizer)" } });
-      if (!res.ok) throw new Error("HTTP " + res.status);
-      const rows = parseVpngateCsv(await res.text());
-      if (!rows.length) throw new Error("官方源解析出 0 个 SSTP 节点");
-      return rows;
-    } catch (e) {
-      const res = await fetchWithTimeout(sources.vpngateMirror, 30000, { headers: { "User-Agent": "Mozilla/5.0" } });
-      if (!res.ok) throw new Error("VPN Gate 官方源与镜像都失败: " + e.message);
-      return parseMirrorJson(await res.json());
+/* ---- 优选IP / 优选域名 的候选构造 ----
+ * 与 CF-Pages-BestCF 一致：段表里每一行取一个随机地址，域名直接取名单，端口统一用设置的端口。
+ * 都不做任何验证，验证在浏览器里由 trace 完成。
+ */
+function parseCidrLine(line) {
+  const m = /^([0-9a-fA-F:.]+)\/(\d{1,3})$/.exec(line);
+  if (!m) return null;
+  const bits = parseInt(m[2], 10);
+  if (!(bits >= 0 && bits <= (m[1].indexOf(":") === -1 ? 32 : 128))) return null;
+  return { base: m[1], bits };
+}
+
+function ipv4ToInt(ip) {
+  const p = String(ip).split(".");
+  if (p.length !== 4) return null;
+  let n = 0;
+  for (const s of p) {
+    const v = parseInt(s, 10);
+    if (!(v >= 0 && v <= 255)) return null;
+    n = n * 256 + v;
+  }
+  return n;
+}
+function intToIpv4(n) {
+  return [(n >>> 24) & 255, (n >>> 16) & 255, (n >>> 8) & 255, n & 255].join(".");
+}
+function ipv6ToBigInt(ip) {
+  let s = String(ip).trim();
+  const zone = s.indexOf("%");
+  if (zone !== -1) s = s.slice(0, zone);
+  const halves = s.split("::");
+  if (halves.length > 2) return null;
+  const head = halves[0] ? halves[0].split(":") : [];
+  const tail = halves.length === 2 && halves[1] ? halves[1].split(":") : [];
+  const fill = 8 - head.length - tail.length;
+  if (fill < 0) return null;
+  if (halves.length === 1 && head.length !== 8) return null;
+  const groups = head.concat(new Array(fill).fill("0"), tail);
+  let n = 0n;
+  for (const g of groups) {
+    if (!/^[0-9a-fA-F]{1,4}$/.test(g)) return null;
+    n = (n << 16n) | BigInt(parseInt(g, 16));
+  }
+  return n;
+}
+function bigIntToIpv6(n) {
+  const parts = [];
+  for (let i = 0; i < 8; i++) { parts.unshift((n & 0xffffn).toString(16)); n >>= 16n; }
+  return parts.join(":");
+}
+
+// 在段里随机取一个地址（保留段前缀，只随机主机位）
+function randomIpFromCidr(base, bits) {
+  if (String(base).indexOf(":") === -1) {
+    const n = ipv4ToInt(base);
+    if (n === null) return null;
+    const hostBits = 32 - bits;
+    if (hostBits <= 0) return base;
+    const off = Math.floor(Math.random() * Math.pow(2, hostBits));
+    return intToIpv4((n + off) >>> 0);
+  }
+  const v6 = ipv6ToBigInt(base);
+  if (v6 === null) return null;
+  const hostBits = 128 - bits;
+  if (hostBits <= 0) return base;
+  let r = 0n;
+  for (let i = 0; i < 4; i++) r = (r << 16n) | BigInt(Math.floor(Math.random() * 65536));
+  return bigIntToIpv6(v6 + (r % (1n << BigInt(hostBits))));
+}
+
+// IP 区间：a.b.c.d-a.b.c.e（两端都算在内），与 BestCF 的 parseIpRange 一致
+function parseIpRange(line) {
+  const sep = String(line).indexOf("-");
+  if (sep <= 0 || sep !== line.lastIndexOf("-")) return null;
+  const startText = line.slice(0, sep).replace(/^\[|\]$/g, "");
+  const endText = line.slice(sep + 1).replace(/^\[|\]$/g, "");
+
+  const s4 = ipv4ToInt(startText);
+  const e4 = ipv4ToInt(endText);
+  if (s4 !== null && e4 !== null) {
+    if (s4 > e4) return null;
+    return { v6: false, base: s4, size: e4 - s4 + 1 };
+  }
+
+  const s6 = ipv6ToBigInt(startText);
+  const e6 = ipv6ToBigInt(endText);
+  if (s6 !== null && e6 !== null) {
+    if (s6 > e6) return null;
+    return { v6: true, base: s6, size: e6 - s6 + 1n };
+  }
+  return null;
+}
+
+function randomIpFromRange(range) {
+  if (!range.v6) {
+    const off = Math.floor(Math.random() * range.size);
+    return intToIpv4((range.base + off) >>> 0);
+  }
+  let r = 0n;
+  for (let i = 0; i < 4; i++) r = (r << 16n) | BigInt(Math.floor(Math.random() * 65536));
+  return bigIntToIpv6(range.base + (r % range.size));
+}
+
+// 优选IP / 优选域名 的候选只有地址有用：国家、城市、ASN 这些字段测出来才知道，
+// 池子里一律留空，省得七份源合起来几千条把 KV 撑大
+function cfItem(host) {
+  const hostText = String(host).indexOf(":") !== -1 ? "[" + host + "]" : String(host);
+  return { address: hostText + ":" + CF_DEFAULT_PORT };
+}
+
+// 段表/名单的兜底：raw.githubusercontent 拉不通时换 jsDelivr 上的同一个仓库
+function mirrorUrl(url) {
+  const prefix = "https://raw.githubusercontent.com/";
+  if (url.indexOf(prefix) === 0) {
+    const rest = url.slice(prefix.length);
+    const slash = rest.indexOf("/");
+    const branch = rest.indexOf("/", slash + 1);
+    if (branch > 0) {
+      const repo = rest.slice(0, slash) + "/" + rest.slice(slash + 1, branch);
+      return "https://cdn.jsdelivr.net/gh/" + repo + "@" + rest.slice(branch + 1);
     }
   }
-  const url = sources[type];
-  if (!url) throw new Error("类型 " + type + " 没有配置数据源");
-  const res = await fetchWithTimeout(url, 45000, { headers: { "User-Agent": "Mozilla/5.0" } });
-  if (!res.ok) throw new Error("数据源返回 HTTP " + res.status);
-  const data = await res.json();
-  return type === "proxyip" ? parseProxyIpList(data) : parseProxyList(data, type);
+  return "";
+}
+
+async function fetchTextWithMirror(url, timeoutMs) {
+  try {
+    const res = await fetchWithTimeout(url, timeoutMs, { headers: { "User-Agent": "Mozilla/5.0" } });
+    if (!res.ok) throw new Error("HTTP " + res.status);
+    return await res.text();
+  } catch (e) {
+    const alt = mirrorUrl(url);
+    if (!alt) throw e;
+    const res = await fetchWithTimeout(alt, timeoutMs, { headers: { "User-Agent": "Mozilla/5.0" } });
+    if (!res.ok) throw e;
+    return await res.text();
+  }
+}
+
+async function fetchCfCandidates(type, cfg, srcList) {
+  // 优选IP 的段表要采样，拉多少由面板上「每次拉取」决定，每份段表各拉这么多
+  const limit = typeCfgOf(cfg, type).pullCount;
+  if (type === "cfdomain") {
+    // 几行域名名单各拉一份，全部并起来去重（名单本身不大，整份都用）；每条记下来自哪一行
+    const texts = await Promise.all(srcList.map(async (src) => {
+      try { return { key: src.key, text: await fetchTextWithMirror(src.url, 45000) }; }
+      catch (e) { return { key: src.key, text: "" }; }
+    }));
+    const seen = {};
+    const items = [];
+    for (const one of texts) {
+      for (const raw of String(one.text || "").split(/\r?\n/)) {
+        const host = raw.trim().replace(/^#.*$/, "").trim();
+        if (!host || host.indexOf(".") === -1 || /[\s/]/.test(host)) continue;
+        if (seen[host]) continue;
+        seen[host] = true;
+        items.push(Object.assign(cfItem(host), { lib: one.key }));
+      }
+    }
+    if (!items.length) throw new Error("域名名单为空");
+    return items;
+  }
+
+  // 每份段表各抽满上限，候选池里同时存着所有源的地址，
+  // 每条记下自己来自哪一行（lib）；优选时只挑当前选中的那份源来测
+  const perLib = await Promise.all(srcList.map(async (src) => {
+    try {
+      return sampleLib(src.key, await fetchTextWithMirror(src.url, 45000), limit);
+    } catch (e) {
+      return [];   // 单份表拉不通就跳过，只要还有别的源能用
+    }
+  }));
+  const items = [];
+  const seen = new Set();
+  for (const list of perLib) {
+    for (const it of list) {
+      if (seen.has(it.address)) continue;
+      seen.add(it.address);
+      items.push(it);
+    }
+  }
+  if (!items.length) throw new Error("所有段表都没能拉到地址");
+  return items;
+}
+
+// 单份段表：与 BestCF 的 prepareCandidates 一致，先分类（固定地址 / CIDR / 区间），各自打乱，
+// 固定地址全部先放，CIDR 和区间轮流随机采样，凑满上限就停
+function sampleLib(key, text, limit) {
+  const lines = String(text || "").split(/\r?\n/).map((s) => s.trim()).filter((s) => s && s.charAt(0) !== "#");
+
+  const fixed = [];
+  const cidrs = [];
+  const ranges = [];
+  for (const line of lines) {
+    if (line.indexOf("/") !== -1) {
+      const cidr = parseCidrLine(line);
+      if (cidr) { cidrs.push(cidr); continue; }
+    }
+    const range = parseIpRange(line);
+    if (range) { ranges.push(range); continue; }
+    if (/^[0-9a-fA-F:.]+$/.test(line)) fixed.push(line);
+  }
+
+  const items = [];
+  const seen = new Set();
+  const add = (host) => {
+    if (!host || seen.has(String(host)) || items.length >= limit) return false;
+    seen.add(String(host));
+    items.push(Object.assign(cfItem(host), { lib: key }));
+    return true;
+  };
+  for (const host of randomSample(fixed, fixed.length)) add(host);
+
+  if (cidrs.length && items.length < limit) {
+    const order = randomSample(cidrs, cidrs.length);
+    let attempts = 0;
+    const maxAttempts = Math.max(limit * 12, order.length * 8);
+    while (items.length < limit && attempts < maxAttempts) {
+      add(randomIpFromCidr(order[attempts % order.length].base, order[attempts % order.length].bits));
+      attempts++;
+    }
+  }
+
+  if (ranges.length && items.length < limit) {
+    const order = randomSample(ranges, ranges.length);
+    let attempts = 0;
+    const maxAttempts = Math.max(limit * 12, order.length * 8);
+    while (items.length < limit && attempts < maxAttempts) {
+      add(randomIpFromRange(order[attempts % order.length]));
+      attempts++;
+    }
+  }
+  return items;
+}
+
+// onlyLib：只拉这一份来源（定时优选传当前选中的 key）；不传则拉该类型全部来源
+async function fetchCandidates(type, cfg, onlyLib) {
+  const allRows = (cfg.cfSources && Array.isArray(cfg.cfSources[type]) && cfg.cfSources[type].length)
+    ? cfg.cfSources[type]
+    : (CF_SOURCES_DEFAULT[type] || []);
+  const rows = onlyLib ? allRows.filter((r) => r.key === onlyLib) : allRows;
+  if (!rows.length) throw new Error("类型 " + type + " 没有配置数据源");
+  if (CF_TYPES.indexOf(type) !== -1) return fetchCfCandidates(type, cfg, rows);
+  // 五类一个套路（SSTP 也一样）：全部并发拉，拉到的合并去重，全失败才报错。
+  // 每条记下自己来自哪一行（lib），页面上选哪一份来源就测哪一份
+  const lists = await Promise.all(rows.map(async (row) => {
+    try {
+      const res = await fetchWithTimeout(row.url, 45000, { headers: { "User-Agent": "Mozilla/5.0" } });
+      if (!res.ok) throw new Error("HTTP " + res.status);
+      // VPN Gate 官方源是 CSV、镜像是 JSON，按内容判断；其余四类是 JSON 名单
+      if (type === "sstp") return { key: row.key, items: parseSstpText(await res.text()) };
+      const data = await res.json();
+      const items = type === "proxyip" ? parseProxyIpList(data) : parseProxyList(data, type);
+      return { key: row.key, items };
+    } catch (e) {
+      return { key: row.key, items: [] };   // 单个源不通就跳过，只要还有别的源能用
+    }
+  }));
+  const merged = [];
+  const seen = new Set();
+  for (const one of lists) {
+    for (const it of one.items) {
+      if (!it || !it.address || seen.has(it.address)) continue;
+      seen.add(it.address);
+      merged.push(Object.assign({}, it, { lib: one.key }));
+    }
+  }
+  if (!merged.length) throw new Error("数据源都没能拉到节点");
+  return merged;
+}
+
+// VPN Gate 的两种格式：官方源是 CSV，镜像是 JSON，按内容判断，不按行号
+function parseSstpText(text) {
+  const s = String(text || "").trim();
+  const asJson = () => {
+    const data = JSON.parse(s);
+    return parseMirrorJson(data);
+  };
+  if (s.charAt(0) === "{" || s.charAt(0) === "[") {
+    try { return asJson(); } catch (e) {}
+  }
+  try { return parseVpngateCsv(s); } catch (e) {}
+  try { return asJson(); } catch (e) {}
+  return [];
 }
 
 /* ========================================================================== *
@@ -2018,20 +2502,69 @@ async function kvPut(env, key, value) {
 
 // 配置版本。v1 的旧配置里存过 maxPool / maxPerType 两个人为上限，v2 起不再有这两项，
 // 旧配置里的残留字段在 normalizeConfig 里被忽略掉，等价于全量。
-const CONFIG_VERSION = 2;
+// v3 起并发 / 超时 / 定时抽样数从全局挪到每类协议（typeCfg），旧配置读出来自动补默认值。
+// v4 起 cfip / cfdomain 的默认超时对齐 BestCF 的 500ms，旧配置里的 2000 会被刷成新默认值。
+// v5 起候选来源（段表列表 / 域名名单）存在 cfSources 里，面板上可增删改。
+// v6 起这个字段覆盖全部七类：另外五类（SOCKS5 / HTTP / HTTPS / SSTP / ProxyIP）的列表源也能在面板上改。
+// v7 起「这一轮测哪一份来源」从单一 cfLib 改成每类一份 libSel，七类页面上都有来源下拉。
+// v8 起定时优选也覆盖七类：autoTypes 补上 cfip / cfdomain，且每轮只拉当前选中的那一份来源。
+const CONFIG_VERSION = 8;
 
 function normalizeConfig(raw) {
   const cfg = Object.assign({}, DEFAULT_CONFIG, raw || {});
-  cfg.domain = String(cfg.domain === undefined || cfg.domain === null ? "" : cfg.domain).trim() || DEFAULT_CONFIG.domain;
-  cfg.concurrency = Math.max(1, Math.min(32, parseInt(cfg.concurrency, 10) || DEFAULT_CONFIG.concurrency));
-  cfg.timeoutMs = Math.max(1000, Math.min(120000, parseInt(cfg.timeoutMs, 10) || DEFAULT_CONFIG.timeoutMs));
-  cfg.autoSample = Math.max(1, Math.min(500, parseInt(cfg.autoSample, 10) || DEFAULT_CONFIG.autoSample));
+  // 定时优选不再有全局地区：每类协议用自己页面上选的地区（存 region:<type>），没选就跳过
+  delete cfg.domain;
+  // 并发 / 超时 / 定时抽样数改成每类协议各存一份，顶层的旧字段洗掉
+  const rawTypeCfg = (raw && raw.typeCfg && typeof raw.typeCfg === "object") ? raw.typeCfg : {};
+  cfg.typeCfg = {};
+  for (const t of PROTOCOLS) {
+    const def = TYPE_DEFAULTS[t] || TYPE_DEFAULTS.socks5;
+    const one = rawTypeCfg[t] || {};
+    cfg.typeCfg[t] = {
+      concurrency: Math.max(1, Math.min(32, parseInt(one.concurrency, 10) || def.concurrency)),
+      timeoutMs: Math.max(100, Math.min(120000, parseInt(one.timeoutMs, 10) || def.timeoutMs)),
+      autoSample: Math.max(1, Math.min(4096, parseInt(one.autoSample, 10) || def.autoSample)),
+      pullCount: Math.max(1, Math.min(4096, parseInt(one.pullCount, 10) || def.pullCount)),
+    };
+  }
+  // v3 时代 cfip / cfdomain 的默认超时是 2000，现在与 BestCF 统一成 500；
+  // 只刷「还是旧默认值 2000」的项，用户自己改成别的值就尊重他的设置
+  if ((parseInt(raw && raw.v, 10) || 0) < 4) {
+    for (const t of CF_TYPES) {
+      if (parseInt(rawTypeCfg[t] && rawTypeCfg[t].timeoutMs, 10) === 2000) {
+        cfg.typeCfg[t].timeoutMs = TYPE_DEFAULTS[t].timeoutMs;
+      }
+    }
+  }
+  delete cfg.concurrency;
+  delete cfg.timeoutMs;
+  delete cfg.autoSample;
   cfg.budgetMs = DEFAULT_CONFIG.budgetMs;   // 固定值，不接受 KV 里的旧配置覆盖
   delete cfg.maxPool;
   delete cfg.maxPerType;
   delete cfg.sstpTimeoutMs;                 // 已合并进 timeoutMs，洗掉旧配置里的字段
   if (!Array.isArray(cfg.autoTypes)) cfg.autoTypes = DEFAULT_CONFIG.autoTypes.slice();
+  // 定时优选的类型集合：七类都能进，轮到时按该类当前选中的来源测一遍
+  // v7 及以前存的是五类（没有 cfip / cfdomain），升级时补齐
   cfg.autoTypes = cfg.autoTypes.filter((t) => PROTOCOLS.indexOf(t) !== -1);
+  if ((parseInt(raw && raw.v, 10) || 0) < 8) {
+    cfg.autoTypes = DEFAULT_CONFIG.autoTypes.slice();
+  }
+  if (!cfg.autoTypes.length) cfg.autoTypes = DEFAULT_CONFIG.autoTypes.slice();
+  cfg.cfSources = sanitizeCfSources(raw && raw.cfSources);
+  // 每类协议各记一份「这一轮测哪一份来源」：值必须是该类来源列表里的 key，
+  // 选中的那份被删掉了就回落到第一份，避免下拉框空白
+  const rawLibSel = (raw && raw.libSel && typeof raw.libSel === "object") ? raw.libSel : {};
+  const legacyLib = String((raw && raw.cfLib) || "");   // v6 及以前只有优选IP 存了这个值
+  cfg.libSel = {};
+  for (const t of PROTOCOLS) {
+    const keys = cfg.cfSources[t].map((x) => x.key);
+    const want = String(rawLibSel[t] || (t === "cfip" ? legacyLib : "") || "");
+    cfg.libSel[t] = keys.indexOf(want) !== -1 ? want : keys[0];
+  }
+  delete cfg.cfLib;
+  delete cfg.cfPort;
+  delete cfg.cfLimit;
   cfg.sources = Object.assign({}, DEFAULT_SOURCES, cfg.sources || {});
   cfg.v = CONFIG_VERSION;
   return cfg;
@@ -2077,6 +2610,7 @@ function pickCountry(item) {
 async function fetchAndStore(env, type, cfg) {
   const items = await fetchCandidates(type, cfg);
   await kvPut(env, "pool:" + type, { fetchedAt: Date.now(), count: items.length, items });
+  // 返回这次写进池子的条数：面板上「候选」是本类的总量，本轮实际测多少由选中的那份源决定
   return items.length;
 }
 
@@ -2085,7 +2619,10 @@ async function fetchAndStore(env, type, cfg) {
 async function runChunk(env, type, cfg, restart, regionsOverride) {
   const pool = await kvGet(env, "pool:" + type, { items: [], fetchedAt: 0 });
   const best = await kvGet(env, "best:" + type, EMPTY_BEST);
-  const all = Array.isArray(pool.items) ? pool.items : [];
+  const rawItems = Array.isArray(pool.items) ? pool.items : [];
+  // 池子里装着该类型全部来源的候选，这一轮只测下拉选中的那一份（老池子没有 lib 字段就照旧全用）
+  const selLib = libSelOf(cfg, type);
+  const all = rawItems.filter((x) => !x.lib || x.lib === selLib);
   if (!all.length) {
     return { type, total: 0, done: 0, finished: true, ok: 0, poolSize: 0, filtered: 0, regions: [], message: "候选池为空，请先拉取候选" };
   }
@@ -2116,7 +2653,7 @@ async function runChunk(env, type, cfg, restart, regionsOverride) {
   if (cursor > limit) cursor = limit;
 
   const deadline = Date.now() + cfg.budgetMs;
-  const concurrency = cfg.concurrency;
+  const concurrency = typeCfgOf(cfg, type).concurrency;
   while (cursor < limit && Date.now() < deadline) {
     const batch = [];
     for (let i = 0; i < concurrency && cursor < limit; i++, cursor++) {
@@ -2213,41 +2750,6 @@ function countryFlag(code) {
   return String.fromCodePoint(key.charCodeAt(0) + 127397, key.charCodeAt(1) + 127397);
 }
 
-// 中文国名 → 两位国家码（COUNTRY_ZH 的反查表），供 DOMAIN 变量用
-// 顺便把「中国香港 / 中国台湾 / 中国澳门」这类带前缀的名字，额外注册一个短名（香港 / 台湾 / 澳门）
-const COUNTRY_CODE_BY_ZH = (function () {
-  const m = {};
-  const add = (name, code) => { if (name && !m[name]) m[name] = code; };
-  for (const code in COUNTRY_ZH) {
-    const zh = COUNTRY_ZH[code];
-    add(zh, code);
-    if (zh && zh.indexOf("中国") === 0 && zh.length > 2) add(zh.slice(2), code);
-  }
-  return m;
-})();
-
-// DOMAIN / 地区输入 → 两位国家码。认：两位码（hk）、中文名（香港）、带前缀写法的短名、英文名取不到就返回空
-function resolveCountryCode(input) {
-  const s = String(input === undefined || input === null ? "" : input).trim();
-  if (!s) return "";
-  if (/^[A-Za-z]{2}$/.test(s)) return s.toUpperCase();
-  const up = s.toUpperCase();
-  if (COUNTRY_ZH[up]) return up;
-  if (COUNTRY_CODE_BY_ZH[s]) return COUNTRY_CODE_BY_ZH[s];
-
-  // 兜底：按结尾匹配，取名字最短的那个（最具体），避免「几内亚」误配到「赤道几内亚」
-  let best = "";
-  let bestLen = Infinity;
-  for (const code in COUNTRY_ZH) {
-    const zh = COUNTRY_ZH[code];
-    if (!zh || zh.length < 2) continue;
-    if (zh === s || (s.length >= 2 && zh.endsWith(s))) {
-      if (zh.length < bestLen) { bestLen = zh.length; best = code; }
-    }
-  }
-  return best;
-}
-
 async function buildState(env, cfg) {
   const state = { config: cfg, types: {}, meta: await kvGet(env, "meta", {}) };
   const built = await Promise.all(PROTOCOLS.map(async (type) => {
@@ -2259,15 +2761,20 @@ async function buildState(env, cfg) {
     const items = sortedResults(best);
     const okItems = items.filter((x) => x.result && x.result.ok);
     const fastest = okItems.length ? okItems[0].result.latency : null;
-    const poolItems = Array.isArray(pool.items) ? pool.items : [];
+    const rawPoolItems = Array.isArray(pool.items) ? pool.items : [];
+    // 池子里装着该类型全部来源的候选：「候选」显示池子总量，
+    // 而地区列表和本轮要测的条数只算下拉选中的那一份源
+    const selLib = libSelOf(cfg, type);
+    const scopedItems = rawPoolItems.filter((x) => !x.lib || x.lib === selLib);
     const filteredCount = regionSelected.length
-      ? poolItems.filter((x) => regionSelected.indexOf(pickCountry(x)) !== -1).length
-      : poolItems.length;
+      ? scopedItems.filter((x) => regionSelected.indexOf(pickCountry(x)) !== -1).length
+      : scopedItems.length;
     const entry = {
       label: TYPE_LABEL[type],
-      poolCount: poolItems.length,
+      poolCount: rawPoolItems.length,
+      libCount: scopedItems.length,
       filteredCount,
-      regions: groupRegions(poolItems, regionSelected),
+      regions: groupRegions(scopedItems, regionSelected),
       regionSelected,
       fetchedAt: pool.fetchedAt || 0,
       total: best.total || 0,
@@ -2276,20 +2783,29 @@ async function buildState(env, cfg) {
       fastestMs: fastest,
       runAt: best.runAt || 0,
       finished: (best.done || 0) >= (best.total || 0) && (best.total || 0) > 0,
-      results: items.slice(0, 200).map((x) => ({
-        address: x.item.address,
-        country: (x.result && x.result.country) || x.item.country || "",
-        countryEmoji: x.item.countryEmoji || countryFlag((x.result && x.result.country) || x.item.country || ""),
-        countryName: x.item.countryCn || countryName((x.result && x.result.country) || x.item.country, x.item.countryEn || ""),
-        city: x.item.city || "",
-        org: x.item.org || "",
-        ok: !!(x.result && x.result.ok),
-        latency: x.result ? x.result.latency : null,
-        exitIp: (x.result && x.result.exitIp) || "",
-        colo: (x.result && x.result.colo) || "",
-        mode: (x.result && x.result.mode) || "",
-        error: (x.result && x.result.error) || "",
-      })),
+      results: items.slice(0, 200).map((x) => {
+        const isCf = CF_TYPES.indexOf(type) !== -1;
+        // 优选IP / 优选域名 拿不到 IP 的归属地，只有 trace 里的 colo（机房三字码），
+        // 按机房所在国家显示，格式和别的协议一致；查不到就原样显示三字码
+        const colo = String((x.result && x.result.colo) || "").toUpperCase();
+        const coloCC = isCf ? (CF_COLO_CC[colo] || "") : "";
+        return {
+          address: x.item.address,
+          country: (x.result && x.result.country) || x.item.country || "",
+          countryEmoji: isCf ? countryFlag(coloCC) : (x.item.countryEmoji || countryFlag((x.result && x.result.country) || x.item.country || "")),
+          countryName: isCf
+            ? (COUNTRY_ZH[coloCC] || colo)
+            : (x.item.countryCn || countryName((x.result && x.result.country) || x.item.country, x.item.countryEn || "")),
+          city: x.item.city || "",
+          org: x.item.org || "",
+          ok: !!(x.result && x.result.ok),
+          latency: x.result ? x.result.latency : null,
+          exitIp: (x.result && x.result.exitIp) || "",
+          colo: colo,
+          mode: (x.result && x.result.mode) || "",
+          error: (x.result && x.result.error) || "",
+        };
+      }),
     };
     return { type, entry };
   }));
@@ -2471,7 +2987,11 @@ async function handleList(request, env, url) {
     const best = await kvGet(env, "best:" + t, EMPTY_BEST);
     const okItems = sortedResults(best).filter((x) => x.result && x.result.ok);
     for (const x of okItems) {
-      const cname = x.item.countryCn || countryName((x.result && x.result.country) || x.item.country, x.item.countryEn || "");
+      // CF 两类只有机房三字码，注释里写机房所在地区的中文名，查不到再退回三字码
+      const colo = String((x.result && x.result.colo) || "").toUpperCase();
+      const cname = CF_TYPES.indexOf(t) !== -1
+        ? (COUNTRY_ZH[CF_COLO_CC[colo] || ""] || colo || "CF")
+        : (x.item.countryCn || countryName((x.result && x.result.country) || x.item.country, x.item.countryEn || ""));
       const lat = (x.result && Number.isFinite(x.result.latency)) ? x.result.latency : 0;
       lines.push(x.item.address + "#" + TYPE_LABEL[t] + "-" + cname + "-" + lat + "ms");
       rows.push({
@@ -2530,6 +3050,72 @@ async function handleApi(request, env, url, ctx) {
 
   if (path === "/api/state") return json(await buildState(env, cfg));
 
+  // 优选IP / 优选域名：候选由服务端拉取并随机采样，检测放到浏览器里做
+  if (path === "/api/cfpool") {
+    const t = url.searchParams.get("type") || body.type;
+    if (CF_TYPES.indexOf(t) === -1) return json({ error: "类型无效" }, 400);
+    const pool = await kvGet(env, "pool:" + t, { items: [], fetchedAt: 0 });
+    const raw = Array.isArray(pool.items) ? pool.items : [];
+    // 池子里装着全部来源的候选，只取下拉选中的那一份（老池子没有 lib 字段就照旧全用）
+    const selLib = libSelOf(cfg, t);
+    const list = raw.filter((x) => !x.lib || x.lib === selLib);
+    const items = list.map((x) => x.address);
+    return json({ type: t, total: items.length, items });
+  }
+
+  // 访问者自己的出口 IP：取 CF-Connecting-IP，供外部脚本查询
+  if (path === "/api/self") {
+    return json({ ip: request.headers.get("CF-Connecting-IP") || "" });
+  }
+
+  // 浏览器测完一轮把结果写回来，存进 best:<type>，表格和订阅都从这里读
+  if (path === "/api/cfresults") {
+    const t = String(body.type || "");
+    if (CF_TYPES.indexOf(t) === -1) return json({ error: "类型无效" }, 400);
+    if (body.restart) {
+      await kvPut(env, "best:" + t, Object.assign({}, EMPTY_BEST));
+      return json({ success: true, reset: true });
+    }
+    const pool = await kvGet(env, "pool:" + t, { items: [] });
+    const poolItems = Array.isArray(pool.items) ? pool.items : [];
+    // 前端只测「当前选中来源」的那一份，下标是过滤后的；池子里装着全部来源，
+    // 直接按 index 取会串到别的来源的地址上，所以先用地址精确对上
+    const byAddr = new Map();
+    for (const it of poolItems) if (it && it.address) byAddr.set(it.address, it);
+    const items = (Array.isArray(body.items) ? body.items : []).map((x) => {
+      const idx = parseInt(x.index, 10) || 0;
+      const hit = x.address ? byAddr.get(x.address) : null;
+      return {
+        index: idx,
+        item: hit || poolItems[idx] || { address: x.address || "" },
+        result: {
+          ok: !!x.ok,
+          latency: Number.isFinite(x.latency) ? x.latency : null,
+          exitIp: x.exitIp || "",
+          country: "",
+          colo: x.colo || "",
+          mode: "trace",
+          error: x.error || "",
+        },
+      };
+    });
+    // 续测时把本轮结果并回旧结果（按 index 覆盖），不清掉已经测完的那些
+    const oldBest = await kvGet(env, "best:" + t, EMPTY_BEST);
+    const mergedMap = new Map();
+    for (const it of (Array.isArray(oldBest.items) ? oldBest.items : [])) mergedMap.set(it.index, it);
+    for (const it of items) mergedMap.set(it.index, it);
+    const merged = Array.from(mergedMap.values()).sort((a, b) => a.index - b.index);
+    await kvPut(env, "best:" + t, {
+      runAt: Date.now(),
+      done: parseInt(body.done, 10) || 0,
+      items: merged,
+      ok: merged.filter((x) => x.result && x.result.ok).length,
+      total: parseInt(body.total, 10) || 0,
+      regionsKey: "",
+    });
+    return json({ success: true });
+  }
+
   const type = body.type || url.searchParams.get("type");
 
   if (path === "/api/pwd") {
@@ -2553,7 +3139,28 @@ async function handleApi(request, env, url, ctx) {
   }
 
   if (path === "/api/config") {
-    const next = normalizeConfig(Object.assign({}, cfg, body.config || body));
+    // typeCfg 按类型逐项合并：面板上只改某一类的并发 / 超时 / 抽样数时，不能把别的类型冲掉
+    const patch = Object.assign({}, body.config || body);
+    if (patch.typeCfg && typeof patch.typeCfg === "object") {
+      const merged = Object.assign({}, cfg.typeCfg);
+      for (const t of PROTOCOLS) {
+        if (patch.typeCfg[t]) merged[t] = Object.assign({}, merged[t], patch.typeCfg[t]);
+      }
+      patch.typeCfg = merged;
+    }
+    // 来源列表按类型合并：改哪一类就只覆盖哪一类，别的类型保留原样
+    if (patch.cfSources && typeof patch.cfSources === "object") {
+      const merged = Object.assign({}, cfg.cfSources);
+      for (const t of PROTOCOLS) {
+        if (Array.isArray(patch.cfSources[t])) merged[t] = patch.cfSources[t];
+      }
+      patch.cfSources = merged;
+    }
+    // 来源选择也按类型合并，换一类的下拉不影响别类
+    if (patch.libSel && typeof patch.libSel === "object") {
+      patch.libSel = Object.assign({}, cfg.libSel, patch.libSel);
+    }
+    const next = normalizeConfig(Object.assign({}, cfg, patch));
     await kvPut(env, "config", next);
     return json({ success: true, config: next });
   }
@@ -2582,6 +3189,8 @@ async function handleApi(request, env, url, ctx) {
 
   if (path === "/api/optimize") {
     if (PROTOCOLS.indexOf(type) === -1) return json({ error: "类型无效" }, 400);
+    // CF 域名由浏览器测（要带 SNI、量本机到目标），结果走 /api/cfresults
+    if (type === "cfdomain") return json({ success: false, type, error: "这一类由浏览器检测，走 /api/cfresults" }, 200);
     try {
       const result = await runChunk(env, type, cfg, !!body.restart);
       if (result.finished) {
@@ -2599,7 +3208,8 @@ async function handleApi(request, env, url, ctx) {
   if (path === "/api/test") {
     if (PROTOCOLS.indexOf(type) === -1) return json({ error: "类型无效" }, 400);
     if (!body.address) return json({ error: "缺少 address" }, 400);
-    const result = await runCheck(type, body.address, cfg);
+    // 单点测试与优选域名同一条测法：串行测 3 次取最小值
+    const result = await runCheck(type, body.address, Object.assign({}, cfg, { samples: 3 }));
     return json(Object.assign({ success: true, type, address: body.address }, result));
   }
 
@@ -2708,6 +3318,11 @@ function renderPanel(cfg, subToken) {
     continentOrder: CONTINENT_ORDER,
     countryZh: COUNTRY_ZH,
     config: cfg,
+    // 每类协议的下拉选项：来源列表在面板上可改，改完前端直接用新列表重画
+    libs: Object.fromEntries(PROTOCOLS.map((t) => [
+      t,
+      (cfg.cfSources[t] || []).map((x) => ({ key: x.key, label: x.label })),
+    ])),
     repo: "https://github.com/bayueqi/ZQ-CSP",
   });
   return `<!DOCTYPE html>
@@ -2719,14 +3334,14 @@ function renderPanel(cfg, subToken) {
 ${FAVICON_LINK}
 <style>
 :root{
-  --bg:#eef1f6; --panel:#fff; --line:#e4e7ec; --line2:#eef1f5;
-  --tx:#101828; --tx2:#475467; --tx3:#98a2b3;
+  --bg:#f4f6fa; --panel:#fff; --line:#e3e8ef; --line2:#eef1f6;
+  --tx:#0f172a; --tx2:#475467; --tx3:#98a2b3;
   --brand:#185FA5; --brand-d:#134d87; --brand-l:#eaf2fb;
   --ok:#067647; --ok-bg:#e7f6ec; --bad:#b42318; --bad-bg:#feeceb;
-  --r:14px; --sh:0 1px 2px rgba(16,24,40,.04),0 2px 6px rgba(16,24,40,.05);
+  --r:16px; --sh:0 1px 2px rgba(16,24,40,.04),0 4px 14px rgba(16,24,40,.05);
 }
 *{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--tx);font:14px/1.6 system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif}
+body{margin:0;background:var(--bg);color:var(--tx);font:14px/1.6 system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif;-webkit-font-smoothing:antialiased}
 a{color:var(--brand);text-decoration:none}
 a:hover{text-decoration:underline}
 
@@ -2739,10 +3354,10 @@ a:hover{text-decoration:underline}
 
 .wrap{max-width:1180px;margin:0 auto;padding:18px 18px 64px}
 
-.card{background:var(--panel);border:1px solid var(--line);border-radius:var(--r);box-shadow:var(--sh);padding:16px 18px;margin-bottom:14px}
-.card h2{font-size:14px;font-weight:600;margin:0 0 12px;display:flex;align-items:center;gap:9px;flex-wrap:wrap}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:var(--r);box-shadow:var(--sh);padding:20px 22px;margin-bottom:16px}
+.card h2{font-size:15px;font-weight:600;margin:0 0 14px;display:flex;align-items:center;gap:9px;flex-wrap:wrap;letter-spacing:.01em}
 .card h2 .dot{width:7px;height:7px;border-radius:50%;background:var(--brand);flex:none}
-.card h2 .apibox{margin:0 0 0 auto;padding:5px 9px;font-size:12px;font-weight:400}
+.card h2 .apibox{margin:0 0 0 auto;padding:2px 8px 2px 3px;font-weight:400;flex:0 1 auto;max-width:100%}
 .tag{font-size:11.5px;font-weight:500;color:var(--tx2);background:#f2f4f7;border:1px solid var(--line2);border-radius:999px;padding:1px 9px}
 .tag.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
 
@@ -2752,7 +3367,7 @@ details.card>summary::after{content:"展开";margin-left:auto;font-size:12px;fon
 details.card[open]>summary::after{content:"收起"}
 details.card[open]>summary{margin-bottom:14px}
 
-button{font:inherit;font-size:13px;font-weight:500;padding:7px 13px;border:1px solid var(--line);background:#fff;border-radius:9px;cursor:pointer;color:var(--tx);transition:background .15s,border-color .15s,transform .06s;white-space:nowrap}
+button{font:inherit;font-size:13px;font-weight:500;height:34px;padding:0 14px;border:1px solid var(--line);background:#fff;border-radius:10px;cursor:pointer;color:var(--tx);transition:background .15s,border-color .15s,transform .06s;white-space:nowrap;display:inline-flex;align-items:center;justify-content:center;gap:6px}
 button:hover{border-color:#cdd3dc;background:#fafbfc}
 button:active{transform:translateY(1px)}
 button:focus-visible{outline:2px solid #9cc3e8;outline-offset:1px}
@@ -2761,36 +3376,60 @@ button.primary:hover{background:var(--brand-d);border-color:var(--brand-d)}
 button.ghost{background:#f8f9fb;color:var(--tx2)}
 button.danger{color:var(--bad);border-color:#f2c7c3;background:#fff}
 button.danger:hover{background:var(--bad-bg);border-color:#e6a6a0}
-button.sm{padding:5px 10px;font-size:12.5px}
+button.sm{height:28px;padding:0 10px;font-size:12.5px;border-radius:8px}
 button:disabled{opacity:.45;cursor:not-allowed;transform:none;box-shadow:none}
 
 .row{display:flex;flex-wrap:wrap;gap:8px;align-items:center}
-label.f{display:flex;flex-direction:column;gap:5px;font-size:12px;color:var(--tx2)}
-input[type=text],input[type=number],input[type=password]{font:inherit;font-size:13px;padding:7px 10px;border:1px solid var(--line);border-radius:9px;color:var(--tx);width:100%;background:#fff;transition:.15s}
+
+/* 工具栏：左主操作、右参数胶囊，第二行留给单点测试 */
+.toolbar{display:flex;flex-wrap:wrap;gap:10px;align-items:center}
+.toolbar + .toolbar{margin-top:10px}
+.tgroup{display:flex;flex-wrap:wrap;gap:8px;align-items:center;min-width:0}
+.tgroup.right{margin-left:auto}
+.params{display:flex;align-items:center;background:#f7f9fc;border:1px solid var(--line2);border-radius:12px;padding:4px}
+.param{display:flex;align-items:center;gap:6px;padding:0 8px}
+.param + .param{border-left:1px solid var(--line)}
+.param label{font-size:11.5px;color:var(--tx3);white-space:nowrap}
+.param input{width:54px;height:26px;padding:0 6px;border:1px solid var(--line2);background:#fff;font-size:12.5px;font-variant-numeric:tabular-nums;text-align:right;border-radius:7px;color:var(--tx)}
+.param input[data-tcfg=timeoutMs]{width:66px}
+.param input:hover{background:#fff;border-color:var(--line)}
+.param input:focus{background:#fff;border-color:#7fb0dd;box-shadow:0 0 0 3px rgba(24,95,165,.13);outline:none}
+.param .u{font-size:11px;color:var(--tx3);margin-left:-2px}
+.tinput{flex:1;min-width:240px;max-width:560px}
+label.f{display:flex;flex-direction:column;gap:6px;font-size:12px;color:var(--tx2)}
+input[type=text],input[type=number],input[type=password]{font:inherit;font-size:13px;height:34px;padding:0 10px;border:1px solid var(--line);border-radius:10px;color:var(--tx);width:100%;background:#fff;transition:.15s}
+select{font:inherit;font-size:13px;height:34px;padding:0 10px;border:1px solid var(--line);border-radius:10px;color:var(--tx);background:#fff;transition:.15s}
+select:focus{outline:none;border-color:#7fb0dd;box-shadow:0 0 0 3px rgba(24,95,165,.13)}
 input[type=text]:focus,input[type=number]:focus,input[type=password]:focus{outline:none;border-color:#7fb0dd;box-shadow:0 0 0 3px rgba(24,95,165,.13)}
 
-.metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(96px,1fr));gap:8px;margin:0 0 12px}
-.metric{background:#f8f9fb;border:1px solid var(--line2);border-radius:10px;padding:8px 10px;min-width:0}
-.metric .k{display:block;font-size:11.5px;color:var(--tx3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.metric b{font-size:16px;font-weight:600;font-variant-numeric:tabular-nums}
+.metrics{display:grid;grid-template-columns:repeat(auto-fit,minmax(124px,1fr));gap:10px;margin:0 0 14px}
+.metric{background:#fafbfc;border:1px solid var(--line2);border-radius:12px;padding:10px 13px;min-width:0}
+.metric .k{display:block;font-size:11.5px;color:var(--tx3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;letter-spacing:.02em}
+.metric b{font-size:19px;font-weight:600;font-variant-numeric:tabular-nums;line-height:1.3;letter-spacing:-.01em}
 .metric.hi b{color:var(--brand)}
 .metric.zero b{color:var(--tx3);font-weight:500}
 
-.bar{height:6px;border-radius:999px;background:#e9edf2;overflow:hidden;margin:0 0 12px}
+.bar{height:5px;border-radius:999px;background:#eef1f6;overflow:hidden;margin:0 0 14px}
 .bar>i{display:block;height:100%;border-radius:999px;background:linear-gradient(90deg,var(--brand),#4a92d6);transition:width .35s ease}
 .bar.done>i{background:linear-gradient(90deg,#0f9d58,#45c07f)}
 
-.card.proto{position:relative;overflow:hidden;padding-left:21px}
+.card.proto{position:relative;overflow:hidden;padding-left:26px}
 .card.proto::before{content:"";position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--acc,var(--brand))}
-.scroll{max-height:330px;overflow:auto;border:1px solid var(--line2);border-radius:10px;margin-top:10px}
-table{width:100%;border-collapse:separate;border-spacing:0;font-size:12.5px}
-thead th{position:sticky;top:0;z-index:1;background:#f8f9fb;text-align:left;color:var(--tx2);font-weight:600;padding:7px 10px;border-bottom:1px solid var(--line);white-space:nowrap}
-tbody td{padding:6px 10px;border-bottom:1px solid var(--line2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:260px}
+.card.proto h2{font-size:16px}
+.scroll{max-height:414px;overflow:auto;border:1px solid var(--line);border-radius:12px;margin-top:14px;background:#fff;box-shadow:inset 0 -16px 14px -15px rgba(16,24,40,.13)}
+table{width:100%;border-collapse:separate;border-spacing:0;font-size:13px;table-layout:fixed}
+thead th{position:sticky;top:0;z-index:1;background:#f9fafb;text-align:left;color:var(--tx2);font-weight:600;font-size:12px;letter-spacing:.02em;padding:9px 12px;border-bottom:1px solid var(--line);white-space:nowrap}
+tbody td{padding:8px 12px;border-bottom:1px solid var(--line2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 tbody tr:last-child td{border-bottom:0}
-tbody tr:hover td{background:#fafbfc}
+tbody tr:hover td{background:#f7faff}
 tr.dead td{color:var(--tx3)}
-.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px}
-.pill{display:inline-block;padding:1px 8px;border-radius:999px;font-size:11.5px;font-weight:500}
+th.num,td.num{text-align:right;font-variant-numeric:tabular-nums}
+th.c,td.c{text-align:center}
+tr.dead td.num{color:#b0b8c4}
+tr.dead td.errline{font-size:12px;color:#98a2b3;padding-top:0;padding-bottom:9px;white-space:normal}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12.5px}
+.pill{display:inline-flex;align-items:center;gap:5px;padding:2px 9px;border-radius:999px;font-size:11.5px;font-weight:500;line-height:1.5}
+.pill::before{content:"";width:5px;height:5px;border-radius:50%;background:currentColor;flex:none}
 .pill.ok{background:var(--ok-bg);color:var(--ok)}
 .pill.bad{background:var(--bad-bg);color:var(--bad)}
 
@@ -2816,7 +3455,8 @@ tr.dead td{color:var(--tx3)}
 .hint{color:var(--tx2);font-size:12.5px;margin-top:8px}
 .hint code,.row code{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}
 code{background:#f2f4f7;border:1px solid var(--line2);border-radius:6px;padding:2px 7px;font-size:12.5px;display:inline-block;max-width:100%;overflow:hidden;text-overflow:ellipsis;vertical-align:middle}
-.empty{color:var(--tx3);font-size:12.5px;padding:14px 2px;text-align:center}
+.empty{margin-top:14px;border:1px dashed var(--line);border-radius:12px;padding:30px 16px;text-align:center;color:var(--tx3);font-size:12.5px;background:#fcfcfd}
+.ovfoot{margin-top:2px;padding-top:12px;border-top:1px solid var(--line2);font-size:11.5px;color:var(--tx3)}
 .boot{display:flex;align-items:center;justify-content:center;gap:9px;padding:38px 0;color:var(--tx3);font-size:13px}
 .boot .sp{width:15px;height:15px;border:2px solid #dfe4ea;border-top-color:var(--brand);border-radius:50%;animation:spin .8s linear infinite;flex:none}
 
@@ -2835,32 +3475,37 @@ code{background:#f2f4f7;border:1px solid var(--line2);border-radius:6px;padding:
 .rcount{color:var(--tx2);font-size:11.5px;min-width:40px;text-align:right;font-variant-numeric:tabular-nums}
 .regscroll{max-height:300px;overflow:auto;padding-right:4px}
 
-.tabs{display:flex;gap:2px;flex-wrap:wrap;margin-left:4px}
-.tab{background:transparent;border:0;color:var(--tx2);font-size:13.5px;font-weight:500;padding:6px 12px;border-radius:8px}
-.tab:hover{background:#f2f4f7;color:var(--tx);border-color:transparent}
-.tab.on{color:var(--brand);background:var(--brand-l)}
+.tabs{display:flex;gap:2px;flex-wrap:wrap;margin-left:10px;padding:3px;background:#f2f4f7;border-radius:11px}
+.tab{background:transparent;border:0;color:var(--tx2);font-size:13px;font-weight:500;height:28px;padding:0 11px;border-radius:8px;box-shadow:none}
+.tab:hover{background:rgba(255,255,255,.75);color:var(--tx);border-color:transparent}
+.tab.on{color:var(--brand-d);background:#fff;box-shadow:0 1px 2px rgba(16,24,40,.09)}
 .icon{display:inline-flex;align-items:center;justify-content:center;width:34px;height:34px;padding:0;border:1px solid var(--line);background:#fff;border-radius:9px;color:var(--tx2)}
 .icon:hover{color:var(--tx);border-color:#cdd3dc;background:#fafbfc}
 .icon.spin svg{animation:spin .9s linear infinite}
 @keyframes spin{to{transform:rotate(360deg)}}
 
-.apibox{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:12px;padding:9px 12px;background:#f8f9fb;border:1px solid var(--line2);border-radius:10px;min-width:0;max-width:100%}
-.apik{flex:none;font-size:11px;font-weight:700;letter-spacing:.5px;color:var(--brand);background:var(--brand-l);border-radius:6px;padding:2px 7px}
-.apiv{cursor:pointer;background:#fff;margin:0;min-width:0;max-width:100%;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.apiv:hover{border-color:#9cc3e8;color:var(--brand)}
+.apibox{display:flex;align-items:center;gap:6px;margin-top:12px;padding:2px 8px 2px 3px;background:#f7f8fa;border:1px solid var(--line2);border-radius:7px;min-width:0;max-width:100%}
+.apik{flex:none;font-size:10px;font-weight:700;letter-spacing:.4px;line-height:1.5;color:var(--brand);background:var(--brand-l);border-radius:5px;padding:1px 6px}
+.apiv{cursor:pointer;background:transparent;border:0;padding:0;margin:0;flex:1 1 auto;min-width:0;max-width:100%;font-size:11.5px;line-height:1.5;color:var(--tx2);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.apiv:hover{color:var(--brand);text-decoration:underline}
+#cfgToken{background:#fff;border:1px solid var(--line);border-radius:8px;padding:7px 10px;font-size:12px;color:var(--tx)}
+#cfgToken:hover{color:var(--tx);text-decoration:none;border-color:#cdd3dc}
 
-.ovgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(168px,1fr));gap:12px;margin-bottom:14px}
-.ovcard{position:relative;overflow:hidden;display:flex;flex-direction:column;background:var(--panel);border:1px solid var(--line);border-radius:var(--r);box-shadow:var(--sh);padding:13px 15px 14px 20px;cursor:pointer;transition:border-color .15s}
+.ovgrid{display:grid;grid-template-columns:repeat(auto-fit,minmax(152px,1fr));gap:10px;margin-bottom:14px}
+.ovcard{position:relative;overflow:hidden;display:flex;flex-direction:column;background:var(--panel);border:1px solid var(--line);border-radius:13px;box-shadow:0 1px 2px rgba(16,24,40,.04);padding:12px 14px 15px 18px;cursor:pointer;transition:border-color .15s,box-shadow .15s}
 .ovcard::before{content:"";position:absolute;left:0;top:0;bottom:0;width:3px;background:var(--acc,var(--brand))}
-.ovcard:hover{border-color:#c3cad6}
-.ovtop{display:flex;align-items:center;gap:8px;margin-bottom:6px}
-.ovtop b{font-size:13.5px}
-.ovnum{display:flex;align-items:baseline;gap:7px}
-.ovnum span{font-size:11.5px;color:var(--tx3)}
-.ovnum b{font-size:22px;font-weight:600;font-variant-numeric:tabular-nums}
-.ovsub{font-size:11.5px;color:var(--tx2);margin-top:6px;margin-bottom:9px}
-.ovsec{padding-left:12px;border-left:3px solid var(--acc,var(--brand))}
-.ovsec + .ovsec{margin-top:20px}
+.ovcard .bar{position:absolute;left:0;right:0;bottom:0;height:3px;margin:0!important;border-radius:0;background:#f0f2f6}
+.ovcard .bar>i{border-radius:0}
+.ovcard:hover{border-color:#c3cad6;box-shadow:0 3px 10px rgba(16,24,40,.07)}
+.ovtop{display:flex;align-items:center;gap:8px;margin-bottom:4px}
+.ovtop b{font-size:12.5px;color:var(--tx2);font-weight:600;letter-spacing:.01em}
+.ovnum{display:flex;align-items:baseline;gap:6px}
+.ovnum span{font-size:11px;color:var(--tx3)}
+.ovnum b{font-size:21px;font-weight:600;font-variant-numeric:tabular-nums;line-height:1.25}
+.ovsub{font-size:11px;color:var(--tx3);margin-top:5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ovsub b{font-weight:600;color:var(--tx2);font-variant-numeric:tabular-nums}
+.ovsec{padding-left:11px;border-left:3px solid var(--acc,var(--brand))}
+.ovsec + .ovsec{margin-top:6px}
 .ovsech{display:flex;align-items:center;gap:8px;width:100%;text-align:left;font:inherit;font-weight:600;padding:4px 0;border:0;background:transparent;border-radius:0;color:var(--tx);white-space:normal;cursor:pointer}
 .ovsech:hover{background:transparent;border-color:transparent;color:var(--tx)}
 .ovsech:active{transform:none}
@@ -2878,6 +3523,15 @@ code{background:#f2f4f7;border:1px solid var(--line2);border-radius:6px;padding:
 .mbox h3{margin:0 0 16px;font-size:15px;font-weight:600;display:flex;align-items:center;gap:8px}
 .mbox .f{margin-bottom:12px}
 .mbox .hint{margin-top:2px}
+/* 来源管理：一行 = 名称 + 地址 + 删除 */
+#mSources .mbox{max-width:680px}
+.srow{display:flex;gap:8px;align-items:center;margin-bottom:8px}
+.srow input{margin:0}
+.srow .sl{flex:0 0 132px}
+/* 地址一列给足宽度，字号小一点好多露几个字符 */
+.srow .su{flex:1 1 0;min-width:0;font-size:11.5px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+.srow .sx{flex:none;width:34px;height:34px;padding:0;line-height:1;font-size:13px;color:var(--tx3)}
+.srow .sx:hover{color:var(--bad);border-color:var(--bad)}
 
 @media (max-width:760px){
   .wrap{padding:14px 12px 48px}
@@ -2892,8 +3546,17 @@ code{background:#f2f4f7;border:1px solid var(--line2);border-radius:6px;padding:
   .tab{padding:6px 11px;font-size:13px;flex:none}
   .icon{width:32px;height:32px}
   .card{padding:14px}
+  .card.proto{padding-left:18px}
+  .params{width:100%;justify-content:space-between}
+  .tgroup.right{margin-left:0;width:100%}
+  .param{flex:1;padding:0 6px}
+  .param input{width:100%}
+  .tinput{max-width:none}
+  /* 窄屏放开固定列宽，否则地址列会被压成 0 */
+  table{table-layout:auto;min-width:520px}
+  col{width:auto!important}
   .card h2{font-size:13.5px;margin-bottom:10px}
-  .card h2 .apibox{flex:0 0 100%;margin:8px 0 0;padding:8px 10px}
+  .card h2 .apibox{flex:0 0 100%;margin:6px 0 0;padding:2px 8px 2px 3px;max-width:none}
   .apiv{flex:1 1 0;min-width:0}
   .metrics{grid-template-columns:repeat(2,1fr);gap:7px}
   .metric{padding:7px 9px}
@@ -2903,6 +3566,8 @@ code{background:#f2f4f7;border:1px solid var(--line2);border-radius:6px;padding:
   thead th,tbody td{padding:6px 8px}
   .scroll{max-height:250px}
   .mbox{padding:16px 14px}
+  .srow{gap:6px}
+  .srow .sl{flex:0 0 96px}
   .row{gap:7px}
   button{padding:7px 12px}
 }
@@ -2940,10 +3605,6 @@ code{background:#f2f4f7;border:1px solid var(--line2);border-radius:6px;padding:
   <div class="mbox">
     <h3><span class="dot"></span>设置</h3>
     <label class="f">管理密码<input type="text" id="cfgPwd" autocomplete="off" placeholder="至少 4 位" style="-webkit-text-security:disc" onfocus="this.type='password'" onblur="this.type='text'"></label>
-    <label class="f">定时优选地区<input type="text" id="cfgDomain" placeholder="香港"></label>
-    <label class="f">并发数（1–32）<input type="number" id="cfgConcurrency" min="1" max="32"></label>
-    <label class="f">超时时间 ms<input type="number" id="cfgTimeoutMs" min="1000" max="120000" step="500"></label>
-    <label class="f">自动优选数量<input type="number" id="cfgAutoSample" min="1" max="500"></label>
     <div class="hint" style="margin-top:12px">订阅令牌（用于 /list/* 和 /check 接口，可与他人分享，<b>不能登录后台</b>）</div>
     <div class="row" style="gap:6px">
       <code id="cfgToken" class="apiv" style="flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;cursor:pointer" title="点击复制"></code>
@@ -2956,6 +3617,20 @@ code{background:#f2f4f7;border:1px solid var(--line2);border-radius:6px;padding:
   </div>
 </div>
 
+<div class="modal" id="mSources">
+  <div class="mbox">
+    <h3><span class="dot"></span><span id="srcTitle">来源管理</span></h3>
+    <div id="srcRows"></div>
+    <div class="row" style="margin-bottom:14px">
+      <button type="button" class="sm ghost" id="btnSrcAdd">添加一行</button>
+    </div>
+    <div class="row" style="justify-content:flex-end">
+      <button id="btnSrcCancel">取消</button>
+      <button class="primary" id="btnSrcSave">保存并重拉</button>
+    </div>
+  </div>
+</div>
+
 <script>
 (function(){
   var BOOT = ${initial};
@@ -2963,6 +3638,21 @@ code{background:#f2f4f7;border:1px solid var(--line2);border-radius:6px;padding:
   var SUB_TOKEN = BOOT.subToken || '';
   var PROTOCOLS = BOOT.protocols;
   var LABELS = BOOT.labels;
+  // 这两类在浏览器里测（量本机到目标），不走服务端检测
+  var CF_TYPES = ['cfip', 'cfdomain'];
+  // 某一类的来源列表（下拉选项）与当前选中的那一份
+  function libListOf(type){
+    var libs = BOOT.libs || {};
+    return libs[type] || [];
+  }
+  function libOf(type){
+    var cfg = (STATE && STATE.config) || BOOT.config || {};
+    var sel = (cfg && cfg.libSel) || {};
+    if(sel[type]) return sel[type];
+    var list = libListOf(type);
+    return list.length ? list[0].key : '';
+  }
+
   var STATE = null;
   var RUNNING = {};
   var STOPPING = {};
@@ -2973,7 +3663,7 @@ code{background:#f2f4f7;border:1px solid var(--line2);border-radius:6px;padding:
   var LOGS = {};
   var TABS = [{ key: 'overview', name: '概览' }];
   for(var ti = 0; ti < PROTOCOLS.length; ti++) TABS.push({ key: PROTOCOLS[ti], name: LABELS[PROTOCOLS[ti]] });
-  var POOL_PLACEHOLDER = { socks5: 'socks5://user:pass@host:port', http: 'http://host:port', https: 'https://host:port', sstp: 'sstp://vpn:vpn@host:port', proxyip: 'ip:port' };
+  var POOL_PLACEHOLDER = { socks5: 'socks5://user:pass@host:port', http: 'http://host:port', https: 'https://host:port', sstp: 'sstp://vpn:vpn@host:port', proxyip: 'ip:port', cfip: 'ip:port', cfdomain: 'domain:port' };
 
   function el(id){ return document.getElementById(id); }
   var ESC_MAP = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' };
@@ -3061,16 +3751,83 @@ code{background:#f2f4f7;border:1px solid var(--line2);border-radius:6px;padding:
   }
 
   function openSettings(){
-    var c = (STATE && STATE.config) || BOOT.config;
     el('cfgPwd').value = '';
-    el('cfgDomain').value = c.domain || '';
-    el('cfgConcurrency').value = c.concurrency;
-    el('cfgTimeoutMs').value = c.timeoutMs;
-    el('cfgAutoSample').value = c.autoSample;
     el('cfgToken').textContent = SUB_TOKEN || '（未生成）';
     el('mSettings').classList.add('open');
   }
   function closeSettings(){ el('mSettings').classList.remove('open'); }
+
+  /* ---- 来源管理 ----
+   * 优选IP 的段表、优选域名的名单都在这里改：一行一个地址，改完按新地址重拉候选。
+   * 地址只接受 http(s) 的纯文本（每行一个 IP / CIDR / IP 区间，或每行一个域名）。
+   */
+  var SRC_TYPE = 'cfip';
+
+  function srcRowHtml(src){
+    return '<div class="srow" data-key="' + esc(src.key || '') + '">'
+      + '<input type="text" class="sl" data-k="label" value="' + esc(src.label || '') + '" placeholder="名称">'
+      + '<input type="text" class="su" data-k="url" value="' + esc(src.url || '') + '" placeholder="https://…" autocomplete="off" spellcheck="false">'
+      + '<button type="button" class="sm ghost sx" data-delsrc="1" title="删除这一行">✕</button>'
+      + '</div>';
+  }
+
+  function srcListOf(type){
+    var cfg = (STATE && STATE.config) || BOOT.config || {};
+    var list = cfg.cfSources && cfg.cfSources[type];
+    return Array.isArray(list) ? list : [];
+  }
+
+  function openSources(type){
+    SRC_TYPE = type;
+    el('srcTitle').textContent = '来源管理 · ' + LABELS[type];
+    var list = srcListOf(type);
+    var html = '';
+    for(var i = 0; i < list.length; i++) html += srcRowHtml(list[i]);
+    el('srcRows').innerHTML = html;
+    el('mSources').classList.add('open');
+  }
+  function closeSources(){ el('mSources').classList.remove('open'); }
+  function addSrcRow(){ el('srcRows').insertAdjacentHTML('beforeend', srcRowHtml({})); }
+
+  // 保存：采集每行的名称和地址，交给服务端归一化后再清结果、按新地址重拉
+  function saveSources(){
+    var rows = document.querySelectorAll('#srcRows .srow');
+    var out = [];
+    for(var i = 0; i < rows.length; i++){
+      var url = (rows[i].querySelector('[data-k="url"]').value || '').trim();
+      if(!url) continue;
+      if(!/^https?:[/][/]/i.test(url)){ log('第 ' + (i + 1) + ' 行地址要以 http:// 或 https:// 开头', SRC_TYPE); return; }
+      out.push({
+        key: rows[i].getAttribute('data-key') || '',
+        label: (rows[i].querySelector('[data-k="label"]').value || '').trim(),
+        url: url
+      });
+    }
+    if(!out.length){ log('至少要留一个来源', SRC_TYPE); return; }
+    var type = SRC_TYPE;
+    var patch = {};
+    patch[type] = out;
+    api('/api/config', { config: { cfSources: patch } }).then(function(r){
+      STATE.config = r.config;
+      BOOT.config = r.config;
+      // 下拉选项跟着新保存的来源列表重画
+      var srcs = (r.config && r.config.cfSources) || {};
+      var libs = {};
+      for(var p = 0; p < PROTOCOLS.length; p++){
+        var pt = PROTOCOLS[p];
+        libs[pt] = (srcs[pt] || []).map(function(x){ return { key: x.key, label: x.label }; });
+      }
+      BOOT.libs = libs;
+      closeSources();
+      log(LABELS[type] + ' 来源已保存 ' + out.length + ' 行，正在按新地址拉取候选…', type);
+      return api('/api/clear', { type: type }).then(function(){
+        return api('/api/fetch', { type: type });
+      }).then(function(f){
+        log(LABELS[type] + ' 候选已重新拉取 ' + ((f && f.poolCount) || 0) + ' 条', type);
+        return loadState();
+      });
+    }).catch(function(e){ log('保存失败：' + e.message, type); });
+  }
 
   // 重新生成订阅令牌
   function regenToken(){
@@ -3084,30 +3841,46 @@ code{background:#f2f4f7;border:1px solid var(--line2);border-radius:6px;padding:
 
   function saveSettings(){
     var newPwd = (el('cfgPwd').value || '').trim();
-    var cfg = {
-      domain: el('cfgDomain').value.trim(),
-      concurrency: parseInt(el('cfgConcurrency').value, 10),
-      timeoutMs: parseInt(el('cfgTimeoutMs').value, 10),
-      autoSample: parseInt(el('cfgAutoSample').value, 10)
-    };
-    api('/api/config', { config: cfg }).then(function(r){
-      STATE.config = r.config;
-      log('设置已保存（DOMAIN ' + (r.config.domain || '') + '，并发 ' + r.config.concurrency + '，超时 ' + r.config.timeoutMs + 'ms）');
-      if(!newPwd){ closeSettings(); return; }
-      if(newPwd.length < 4){ log('新密码至少 4 位，密码未修改'); closeSettings(); return; }
-      return api('/api/pwd', { newPwd: newPwd }).then(function(p){
-        // 服务端已换新令牌，这里同步内存里的值，改密后面板上的地址立刻可用
-        if(p.token) SUB_TOKEN = p.token;
-        log('管理密码已更新');
-        closeSettings();
-      });
+    if(!newPwd){ closeSettings(); return; }
+    if(newPwd.length < 4){ log('新密码至少 4 位，密码未修改'); closeSettings(); return; }
+    api('/api/pwd', { newPwd: newPwd }).then(function(p){
+      // 服务端已换新令牌，这里同步内存里的值，改密后面板上的地址立刻可用
+      if(p.token) SUB_TOKEN = p.token;
+      log('管理密码已更新');
+      closeSettings();
     }).catch(function(e){ log('保存设置失败：' + e.message); });
   }
 
-  var ACCENT = { socks5: '#c0269a', http: '#5c6672', https: '#7a5cf0', sstp: '#d98800', proxyip: '#d2544d' };
+  var ACCENT = { socks5: '#c0269a', http: '#5c6672', https: '#7a5cf0', sstp: '#d98800', proxyip: '#d2544d', cfip: '#f6821f', cfdomain: '#0ea5e9' };
 
-  function metric(k, v, cls){
-    return '<div class="metric' + (cls ? ' ' + cls : '') + '"><span class="k">' + k + '</span><b>' + v + '</b></div>';
+  function metric(k, v, cls, title){
+    return '<div class="metric' + (cls ? ' ' + cls : '') + '"' + (title ? ' title="' + esc(title) + '"' : '') + '><span class="k">' + k + '</span><b>' + v + '</b></div>';
+  }
+
+  // 某一类协议自己的并发 / 超时 / 定时抽样数（服务端按同样结构存在 config.typeCfg 里）
+  function typeCfg(type){
+    var all = (STATE && STATE.config && STATE.config.typeCfg) || (BOOT.config && BOOT.config.typeCfg) || {};
+    var o = all[type] || {};
+    var quick = (type === 'cfip' || type === 'cfdomain');
+    return {
+      concurrency: parseInt(o.concurrency, 10) || 16,
+      timeoutMs: parseInt(o.timeoutMs, 10) || (quick ? 500 : 10000),
+      autoSample: parseInt(o.autoSample, 10) || 20,
+      pullCount: parseInt(o.pullCount, 10) || 512
+    };
+  }
+
+  // 来源下拉：池子里该类全部来源的候选都有，这里只决定这一轮测哪一份
+  function cfLibOptions(type){
+    var list = libListOf(type);
+    if(!list.length) return '';
+    var cur = libOf(type);
+    var out = '';
+    for(var i = 0; i < list.length; i++){
+      var x = list[i];
+      out += '<option value="' + esc(x.key) + '"' + (x.key === cur ? ' selected' : '') + '>' + esc(x.label) + '</option>';
+    }
+    return out;
   }
 
   function pctOf(t){ return t.total > 0 ? Math.min(100, Math.round(t.done * 100 / t.total)) : 0; }
@@ -3122,14 +3895,14 @@ code{background:#f2f4f7;border:1px solid var(--line2);border-radius:6px;padding:
   // 结果行：协议页（带「状态」列和失败原因行）与概览（不带）共用
   function rowHtml(r, idx, withStatus){
     var html = '<tr' + (withStatus && !r.ok ? ' class="dead"' : '') + '>';
-    html += '<td class="mono">' + (idx + 1) + '</td>';
+    html += '<td class="mono c">' + (idx + 1) + '</td>';
     html += '<td class="mono addr" data-copy="' + esc(r.address) + '" title="点击复制">' + esc(r.address) + '</td>';
     if(withStatus) html += '<td>' + (r.ok ? '<span class="pill ok">成功</span>' : '<span class="pill bad">失败</span>') + '</td>';
-    html += '<td class="mono">' + fmtMs(r.latency) + '</td>';
+    html += '<td class="mono num">' + fmtMs(r.latency) + '</td>';
     html += '<td class="mono">' + esc(r.exitIp) + '</td>';
-    html += '<td>' + countryCell(r) + '</td>';
+    html += '<td' + (r.colo ? ' title="' + esc(r.colo) + '"' : '') + '>' + countryCell(r) + '</td>';
     html += '</tr>';
-    if(withStatus && !r.ok && r.error) html += '<tr class="dead"><td></td><td colspan="5" title="' + esc(r.error) + '">' + esc(r.error) + '</td></tr>';
+    if(withStatus && !r.ok && r.error) html += '<tr class="dead"><td></td><td colspan="5" class="errline" title="' + esc(r.error) + '">' + esc(r.error) + '</td></tr>';
     return html;
   }
 
@@ -3144,6 +3917,7 @@ code{background:#f2f4f7;border:1px solid var(--line2);border-radius:6px;padding:
       }
       if(!pickedName) pickedName = picked[0];
     }
+    // 停在一半就显示「继续优选」，七类都一样
     var partial = t.done > 0 && !t.finished && t.total > 0;
     var html = '';
     html += '<div class="card proto" style="--acc:' + (ACCENT[type] || '#185FA5') + '">';
@@ -3152,15 +3926,23 @@ code{background:#f2f4f7;border:1px solid var(--line2);border-radius:6px;padding:
     html += apiBox(type);
     html += '</h2>';
     html += '<div class="metrics" style="margin-top:12px">';
-    html += metric('候选', t.poolCount + (picked.length ? ' / ' + esc(pickedName) + t.filteredCount : ''), t.poolCount > 0 ? 'hi' : 'zero');
+    // 候选 = 池子里的总条数（优选IP 是七份源合起来的量）；待测 = 这一轮真正要测的条数
+    // （优选IP 只测下拉选中的那份源，其余协议按已选地区过滤，没选地区就是 0）
+    var needRegion = type !== 'cfdomain' && type !== 'cfip';
+    var todo = (needRegion && !picked.length) ? 0 : t.filteredCount;
+    var todoLabel = type === 'cfip' ? '待测 IP' : (type === 'cfdomain' ? '待测域名' : '待测');
+    html += metric('候选', t.poolCount, t.poolCount > 0 ? 'hi' : 'zero');
+    html += metric(todoLabel, todo, todo > 0 ? 'hi' : 'zero');
     html += metric('已测', t.done + ' / ' + t.total);
     html += metric('可用', t.ok, t.ok > 0 ? 'hi' : 'zero');
     html += metric('最快', fmtMs(t.fastestMs));
     html += '</div>';
-    html += barHtml(t);
-    var noRegion = !picked.length;
+    if(t.total > 0) html += barHtml(t);
+    var noRegion = type !== 'cfdomain' && type !== 'cfip' && !picked.length;
     var gate = ' data-gate="region"' + (noRegion ? ' disabled title="请先选择地区"' : '');
-    html += '<div class="row">';
+    var tc = typeCfg(type);
+    html += '<div class="toolbar">';
+    html += '<div class="tgroup">';
     if(RUNNING[type]){
       html += '<button type="button" class="primary" data-act="pause" data-type="' + type + '">暂停优选</button>';
     } else if(partial){
@@ -3168,10 +3950,25 @@ code{background:#f2f4f7;border:1px solid var(--line2);border-radius:6px;padding:
     } else {
       html += '<button type="button" class="primary" data-act="start" data-type="' + type + '"' + gate + '>开始优选</button>';
     }
-    html += '<button type="button" data-act="region" data-type="' + type + '">' + (picked.length ? '地区：' + esc(pickedName) : '选择地区') + '</button>';
+    if(type !== 'cfdomain' && type !== 'cfip') html += '<button type="button" data-act="region" data-type="' + type + '">' + (picked.length ? '地区：' + esc(pickedName) : '选择地区') + '</button>';
     html += '<button type="button" class="danger" data-act="clear" data-type="' + type + '">清空结果</button>';
+    // 池子里该类全部来源的候选都有，这个下拉只决定「这一轮测哪一份源」
+    html += '<select id="cfLib-' + type + '" data-lib="' + type + '" style="flex:none;width:auto" title="来源">' + cfLibOptions(type) + '</select>';
+    // 候选来源的地址在弹窗里改，改完按新地址重拉候选
+    html += '<button type="button" data-act="srcs" data-type="' + type + '">来源</button>';
+    html += '</div>';
+    // 这一类自己的并发 / 超时 / 定时抽样数，改完即时存回配置
+    html += '<div class="tgroup right"><div class="params">';
+    // 优选IP 的段表按这个数采样，每份段表各拉这么多条；优选域名名单直接整份用
+    if(type === 'cfip') html += '<span class="param"><label>每次拉取</label><input type="number" data-tcfg="pullCount" data-type="' + type + '" min="1" max="4096" value="' + tc.pullCount + '"></span>';
+    html += '<span class="param"><label>并发数量</label><input type="number" data-tcfg="concurrency" data-type="' + type + '" min="1" max="32" value="' + tc.concurrency + '"></span>';
+    html += '<span class="param"><label>超时时间</label><input type="number" data-tcfg="timeoutMs" data-type="' + type + '" min="100" max="120000" step="100" value="' + tc.timeoutMs + '"><span class="u">ms</span></span>';
+    html += '<span class="param"><label>自动优选数量</label><input type="number" data-tcfg="autoSample" data-type="' + type + '" min="1" max="4096" value="' + tc.autoSample + '"></span>';
+    html += '</div></div>';
+    html += '</div>';
+    html += '<div class="toolbar">';
     if(noRegion) html += '<span class="hint" style="margin:0;color:var(--bad)">先点「选择地区」选一个地区</span>';
-    html += '<input type="text" id="test-' + type + '" class="mono" autocomplete="off" placeholder="单点测试：' + esc(POOL_PLACEHOLDER[type]) + '" style="flex:1;min-width:200px">';
+    html += '<input type="text" id="test-' + type + '" class="mono tinput" autocomplete="off" placeholder="单点测试：' + esc(POOL_PLACEHOLDER[type]) + '">';
     html += '<button type="button" data-act="test" data-type="' + type + '">测试</button>';
     html += '</div>';
     html += '<div class="regbox' + (REGOPEN[type] ? ' open' : '') + '" id="regionbox-' + type + '">';
@@ -3208,7 +4005,7 @@ code{background:#f2f4f7;border:1px solid var(--line2);border-radius:6px;padding:
     html += metric('已测', totalDone);
     html += metric('可用节点', totalOk, totalOk > 0 ? 'hi' : 'zero');
     html += '</div>';
-    html += '<div class="hint">上次完成优选：' + fmtTime(STATE.meta && STATE.meta.lastRun) + '</div>';
+    html += '<div class="ovfoot">上次完成优选：' + fmtTime(STATE.meta && STATE.meta.lastRun) + '</div>';
     html += '</div>';
 
     html += '<div class="ovgrid">';
@@ -3218,8 +4015,9 @@ code{background:#f2f4f7;border:1px solid var(--line2);border-radius:6px;padding:
       html += '<div class="ovcard" data-goto="' + ty + '" style="--acc:' + (ACCENT[ty] || '#185FA5') + '" title="点击进入 ' + LABELS[ty] + '">';
       html += '<div class="ovtop"><b>' + LABELS[ty] + '</b></div>';
       html += '<div class="ovnum"><span>可用</span><b>' + tt.ok + '</b></div>';
-      html += '<div class="ovsub">候选 ' + tt.poolCount + ' · 已测 ' + tt.done + '/' + tt.total + ' · 最快 ' + fmtMs(tt.fastestMs) + '</div>';
-      html += barHtml(tt, 'margin:auto 0 0');
+      html += '<div class="ovsub">候选 ' + tt.poolCount + ' · 已测 ' + tt.done + ' / ' + tt.total + '</div>';
+      html += '<div class="ovsub">最快 <b>' + fmtMs(tt.fastestMs) + '</b></div>';
+      html += barHtml(tt, 'margin:0');
       html += '</div>';
     }
     html += '</div>';
@@ -3257,14 +4055,15 @@ code{background:#f2f4f7;border:1px solid var(--line2);border-radius:6px;padding:
 
   // 结果表外壳：概览页不带「状态」列、也不限高，列头和外壳就收在这一处
   function tableShell(rows, withStatus, style){
-    var head = '<tr><th>#</th><th>地址</th>' + (withStatus ? '<th>状态</th>' : '') + '<th>延迟</th><th>出口 IP</th><th>国家/地区</th></tr>';
+    var head = '<tr><th class="c">#</th><th>地址</th>' + (withStatus ? '<th>状态</th>' : '') + '<th class="num">延迟</th><th>出口 IP</th><th>国家/地区</th></tr>';
+    var cols = '<colgroup><col style="width:52px"><col>' + (withStatus ? '<col style="width:104px">' : '') + '<col style="width:94px"><col style="width:172px"><col style="width:138px"></colgroup>';
     var body = '';
     for(var i = 0; i < rows.length; i++) body += rowHtml(rows[i], i, withStatus);
-    return '<div class="scroll"' + (style ? ' style="' + style + '"' : '') + '><table><thead>' + head + '</thead><tbody>' + body + '</tbody></table></div>';
+    return '<div class="scroll"' + (style ? ' style="' + style + '"' : '') + '><table>' + cols + '<thead>' + head + '</thead><tbody>' + body + '</tbody></table></div>';
   }
 
   function resultTable(rows){
-    if(!rows || !rows.length) return '<div class="scroll"><div class="empty">还没有结果，点「开始优选」会先拉取候选再检测。</div></div>';
+    if(!rows || !rows.length) return '<div class="empty">还没有结果，点「开始优选」会先拉取候选再检测。</div>';
     return tableShell(rows, true);
   }
 
@@ -3373,6 +4172,7 @@ code{background:#f2f4f7;border:1px solid var(--line2);border-radius:6px;padding:
         else if(act === 'pause') doPause(type);
         else if(act === 'clear') doClear(type);
         else if(act === 'test') doTest(type);
+        else if(act === 'srcs') openSources(type);
         else if(act === 'region' || act === 'ovtoggle'){
           // 两个都是「展开/收起」：换各自的开关变量和元素 id 前缀
           var isRegion = (act === 'region');
@@ -3389,6 +4189,45 @@ code{background:#f2f4f7;border:1px solid var(--line2);border-radius:6px;padding:
         saveRegion(this.getAttribute('data-reg'));
       });
     }
+    var libSel = document.querySelectorAll('select[data-lib]');
+    for(var s = 0; s < libSel.length; s++){
+      libSel[s].addEventListener('change', function(){
+        switchLib(this.getAttribute('data-lib'), this.value);
+      });
+    }
+    var tcfgs = document.querySelectorAll('input[data-tcfg]');
+    for(var k = 0; k < tcfgs.length; k++){
+      tcfgs[k].addEventListener('change', function(){
+        saveTypeCfg(this.getAttribute('data-type'), this.getAttribute('data-tcfg'), this.value, this);
+      });
+    }
+  }
+
+  // 页面上改某一类的并发 / 超时 / 自动数量：只提交这一类，服务端按类型合并
+  function saveTypeCfg(type, key, value, input){
+    var n = parseInt(value, 10);
+    if(!isFinite(n) || n <= 0){ input.value = typeCfg(type)[key]; return; }
+    var body = { typeCfg: {} };
+    body.typeCfg[type] = {};
+    body.typeCfg[type][key] = n;
+    api('/api/config', { config: body }).then(function(r){
+      STATE.config = r.config;
+      input.value = typeCfg(type)[key];
+      // 拉取数量变了，池子里的候选整批换掉：先清掉上一轮结果，再按新数量重新拉一次
+      if(key === 'pullCount'){
+        log(LABELS[type] + ' 每次拉取已设为 ' + typeCfg(type).pullCount + '，正在重新拉取候选…', type);
+        return api('/api/clear', { type: type }).then(function(){
+          return api('/api/fetch', { type: type });
+        }).then(function(f){
+          log(LABELS[type] + ' 候选已重新拉取 ' + ((f && f.poolCount) || 0) + ' 条', type);
+          return loadState();
+        });
+      }
+      log(LABELS[type] + ' 已设为 并发 ' + typeCfg(type).concurrency + ' / 超时 ' + typeCfg(type).timeoutMs + 'ms / 自动数量 ' + typeCfg(type).autoSample, type);
+    }).catch(function(e){
+      input.value = typeCfg(type)[key];
+      log('保存失败：' + e.message, type);
+    });
   }
 
   function closeRegion(type){
@@ -3411,9 +4250,13 @@ code{background:#f2f4f7;border:1px solid var(--line2);border-radius:6px;padding:
     }
   }
 
-  function loadState(){
+  function loadState(quiet){
     return api('/api/state').then(function(s){
       STATE = s;
+      if(quiet) return;
+      // 正在输入参数时不要整页重绘：重绘会把输入框换成新节点，光标和还没提交的值都会丢
+      var a = document.activeElement;
+      if(a && /^(INPUT|SELECT|TEXTAREA)$/.test(a.tagName)) return;
       render();
     }).catch(function(e){
       log('加载状态失败：' + e.message);
@@ -3499,7 +4342,7 @@ code{background:#f2f4f7;border:1px solid var(--line2);border-radius:6px;padding:
   // 「开始 / 继续」优选共用的启动流程：校验地区 → 置运行位 → 刷新界面 → 记日志
   function beginRun(type, msg){
     if(RUNNING[type]) return false;
-    if(!regionPicked(type)){ log('还没选地区，先在「选择地区」里选一个再优选', type); return false; }
+    if(CF_TYPES.indexOf(type) === -1 && !regionPicked(type)){ log('还没选地区，先在「选择地区」里选一个再优选', type); return false; }
     closeRegion(type);
     RUNNING[type] = true;
     STOPPING[type] = false;
@@ -3511,14 +4354,274 @@ code{background:#f2f4f7;border:1px solid var(--line2);border-radius:6px;padding:
 
   // 开始优选 = 直接用进面板时已拉取的候选池，从零优选（不再重复拉取）
   function doStart(type){
+    if(type === 'cfdomain' || type === 'cfip') return runCf(type, true);
     if(!beginRun(type, '开始优选 ' + LABELS[type] + '…')) return;
     runChunks(type, true, function(msg){ finish(type, LABELS[type] + ' ' + msg); });
   }
 
   // 继续优选 = 用现有池子接着上次的进度跑（不重拉）
   function doContinue(type){
+    if(type === 'cfdomain' || type === 'cfip') return runCf(type, false);
     if(!beginRun(type, '继续优选 ' + LABELS[type] + '…')) return;
     runChunks(type, false, function(msg){ finish(type, LABELS[type] + ' ' + msg); });
+  }
+
+  // 换来源：该类全部来源的候选进面板时就都拉好放在池子里了，
+  // 这个下拉只是换个筛子，不需要重新拉取
+  function switchLib(type, key){
+    if(!key) return;
+    if(key === libOf(type)) return;
+    var name = key;
+    var list = libListOf(type);
+    for(var i = 0; i < list.length; i++){ if(list[i].key === key){ name = list[i].label; break; } }
+    var body = { libSel: {} };
+    body.libSel[type] = key;
+    // 换源只是换筛子：上一轮结果原样留着，点「开始优选」才会覆盖
+    api('/api/config', { config: body }).then(function(){
+      log('来源已切到 ' + name + '，上一轮结果保留', type);
+      loadState();
+    }).catch(function(e){
+      log('切换来源失败：' + ((e && e.message) || '未知错误'), type);
+    });
+  }
+
+  /* ---- 浏览器侧测速（CF 域名 / CF IP） ----
+   * 两类都在本机浏览器里发请求，量的是本机到目标的往返：
+   * - CF 域名：GET https://域名[:端口]/cdn-cgi/trace，校验 h 是本域名、loc 是 CN，
+   *   然后串行发 3 次取最小值当延迟。
+   * - CF IP：把 IP 编成泛解析域名的子域名，请求 https://<label>.<BEST_HOST>/ip.json，
+   *   同样是 OPTIONS 建连 + GET 掐表，改写成子域名是为了让浏览器带上 SNI。
+   */
+  function cfHostPort(address){
+    var s = String(address || '').trim();
+    var host = s, port = 443;
+    if(host.charAt(0) === '['){
+      var close = host.indexOf(']');
+      if(close === -1) return null;
+      var tail = host.slice(close + 1);
+      host = host.slice(1, close);
+      if(tail.charAt(0) === ':') port = parseInt(tail.slice(1), 10) || 443;
+    } else if(host.split(':').length === 2){
+      // 只有一个冒号才是 host:port；IPv6 裸地址（多个冒号）不切端口，端口按 443
+      var c = host.lastIndexOf(':');
+      port = parseInt(host.slice(c + 1), 10) || 443;
+      host = host.slice(0, c);
+    }
+    if(!host) return null;
+    return { host: host, port: port };
+  }
+
+  function cfUrl(hp){
+    var suffix = (hp.port && hp.port !== 443) ? ':' + hp.port : '';
+    var host = hp.host.indexOf(':') !== -1 ? '[' + hp.host + ']' : hp.host;
+    return 'https://' + host + suffix + '/cdn-cgi/trace?_t=' + Date.now();
+  }
+
+  function cfFetch(url, ms, method){
+    var ctl = new AbortController();
+    var timer = setTimeout(function(){ try{ ctl.abort(); }catch(e){} }, ms);
+    return fetch(url, { method: method || 'GET', cache: 'no-store', credentials: 'omit', signal: ctl.signal })
+      .then(function(r){
+        // 与 BestCF 的 fetchWithTimeout 对齐：响应头到了就撤掉超时，body 再慢也不再掐断
+        clearTimeout(timer);
+        return r.text().then(function(t){ return { ok: r.ok, status: r.status, text: t }; });
+      }, function(e){
+        clearTimeout(timer);
+        throw e;
+      });
+  }
+
+  function cfParse(text){
+    var o = {};
+    String(text || '').split(/\\r\\n|\\r|\\n/).forEach(function(line){
+      var eq = line.indexOf('=');
+      if(eq <= 0) return;
+      o[line.slice(0, eq).trim()] = line.slice(eq + 1).trim();
+    });
+    return o;
+  }
+
+  /* ---- 优选IP ----
+   * 浏览器不能直连裸 IP（TLS 不给 IP 字面量发 SNI），源码的做法是把 IP 编成子域名：
+   * 104.16.1.1 → 68100101.ns.psb.kdns.fr，这个泛解析域名会把前缀解回 104.16.1.1，
+   * 浏览器就有域名可用，请求落到该 IP 上的 CF 边缘，那边回 /ip.json。
+   * 测法与源码一致：OPTIONS 先探 3 次（超时给两倍），再 GET 一次计时，超过超时判失败。
+   */
+  var BEST_HOST = 'ns.psb.kdns.fr';
+
+  function ipProbeLabel(host){
+    if(host.indexOf(':') !== -1) return host.toLowerCase().replace(/:/g, '-');
+    var p = host.split('.');
+    if(p.length !== 4) return '';
+    var out = '';
+    for(var i = 0; i < 4; i++){
+      var n = parseInt(p[i], 10);
+      if(!(n >= 0 && n <= 255)) return '';
+      out += ('0' + n.toString(16)).slice(-2).toUpperCase();
+    }
+    return out;
+  }
+
+  function ipProbeUrl(address, path){
+    var hp = cfHostPort(address);
+    if(!hp) return '';
+    var label = ipProbeLabel(hp.host);
+    if(!label) return '';
+    return 'https://' + label + '.' + BEST_HOST + ':' + hp.port + '/' + path + '?_t=' + Date.now();
+  }
+
+  function testCfIp(address, timeoutMs){
+    var url = ipProbeUrl(address, 'ip.json');
+    if(!url) return Promise.resolve({ ok: false, error: '地址格式无效' });
+
+    function options(n){
+      return cfFetch(url, timeoutMs * 2, 'OPTIONS').then(function(r){
+        if(r.ok) return null;
+        throw new Error('OPTIONS HTTP ' + r.status);
+      }).catch(function(e){
+        if(n >= 2) throw e;
+        return options(n + 1);
+      });
+    }
+
+    return options(0).then(function(){
+      var started = performance.now();
+      return cfFetch(url, timeoutMs).then(function(r){
+        if(!r.ok) throw new Error('GET 不可用');
+        var d;
+        try { d = JSON.parse(r.text); } catch(e){ throw new Error('返回内容不是 JSON'); }
+        var latency = Math.max(1, Math.round(performance.now() - started));
+        if(latency > timeoutMs) throw new Error('延迟超过超时时间');
+        var ip = String(d.ip || '');
+        return { ok: true, latency: latency, exitIp: ip, colo: d.colo || '' };
+      });
+    }).catch(function(e){
+      return { ok: false, error: (e && e.message) || '失败' };
+    });
+  }
+
+  function testCf(address, timeoutMs){
+    var hp = cfHostPort(address);
+    if(!hp) return Promise.resolve({ ok: false, error: '地址格式无效' });
+    var url = cfUrl(hp);
+
+    function grab(n){
+      return cfFetch(url, timeoutMs).then(function(r){
+        if(!r.ok) throw new Error('GET 不可用');
+        var trace = cfParse(r.text);
+        if(String(trace.h || '').toLowerCase() !== hp.host.toLowerCase()) throw new Error('h 与请求域名不一致');
+        if(String(trace.loc || '').toUpperCase() !== 'CN') throw new Error('出口不在国内');
+        return trace;
+      }).catch(function(e){
+        if(n >= 3) throw e;
+        return grab(n + 1);
+      });
+    }
+
+    return grab(0).then(function(trace){
+      var samples = [], round = 0;
+      function measure(){
+        if(round >= 3) return Promise.resolve();
+        round++;
+        var started = performance.now();
+        return cfFetch(url, timeoutMs).then(function(r){
+          if(r.ok) samples.push(Math.max(1, Math.round(performance.now() - started)));
+        }).catch(function(){}).then(measure);
+      }
+      return measure().then(function(){
+        if(!samples.length) return { ok: false, error: '测速失败' };
+        return { ok: true, latency: Math.min.apply(null, samples), colo: trace.colo || '', exitIp: trace.ip || '' };
+      });
+    }).catch(function(e){
+      return { ok: false, error: (e && e.message) || '失败' };
+    });
+  }
+
+  function runCf(type, restart){
+    if(RUNNING[type]) return;
+    if(!STATE || !STATE.types || !STATE.types[type]) return;
+    RUNNING[type] = true;
+    STOPPING[type] = false;
+    render();
+    setBusy(type, true);
+    log((restart ? '开始优选 ' : '继续优选 ') + LABELS[type] + '…', type);
+
+    var list = [], conc = 16, timeoutMs = 10000, results = [], finished = 0;
+    var chain = Promise.resolve();
+    // 两类都从浏览器发请求，只是取参数的端点不同：优选IP 走 /ip.json，优选域名走 /cdn-cgi/trace
+    var probe = (type === 'cfip') ? testCfIp : testCf;
+
+    function snapshot(){
+      var items = [];
+      for(var i = 0; i < list.length; i++){
+        var r = results[i];
+        if(!r) continue;
+        items.push({ index: i, address: list[i], ok: r.ok, latency: r.latency, colo: r.colo, exitIp: r.exitIp, error: r.error });
+      }
+      return { type: type, done: finished, total: list.length, items: items };
+    }
+    function save(){
+      var payload = snapshot();
+      chain = chain.then(function(){
+        return api('/api/cfresults', payload).catch(function(){});
+      }).then(function(){ return loadState(); });
+      return chain;
+    }
+
+    // 重启就清空上一轮结果；续测不清空，从上次停下的位置接着测
+    var prep = restart ? api('/api/cfresults', { type: type, restart: true }) : Promise.resolve(null);
+    prep
+      .then(function(){ return api('/api/cfpool', { type: type }); })
+      .then(function(pool){
+        list = (pool && pool.items) || [];
+        if(!list.length){
+          var e = new Error('候选池为空，刷新一次数据源再试');
+          e.friendly = e.message;
+          throw e;
+        }
+        var tcf = typeCfg(type);
+        conc = Math.max(1, Math.min(32, tcf.concurrency));
+        timeoutMs = tcf.timeoutMs;
+        // 续测：池子总条数与上次一致才认为下标对得上，否则从头测
+        var prev = STATE.types[type] || {};
+        var startAt = 0;
+        if(!restart && parseInt(prev.total, 10) === list.length){
+          startAt = Math.max(0, Math.min(parseInt(prev.done, 10) || 0, list.length));
+        }
+        finished = startAt;
+        results = new Array(list.length);
+        log('候选 ' + list.length + ' 条，并发 ' + conc + (startAt ? '，从第 ' + (startAt + 1) + ' 条接着测' : ''), type);
+        var next = startAt, active = 0;
+        return new Promise(function(resolve){
+          function pump(){
+            if(next >= list.length && active === 0){ resolve(); return; }
+            while(!STOPPING[type] && active < conc && next < list.length){
+              (function(idx){
+                active++;
+                probe(list[idx], timeoutMs).then(function(r){
+                  results[idx] = r;
+                  active--;
+                  finished++;
+                  if(STOPPING[type]) log('已暂停，不再发新的候选', type);
+                  if(finished % 20 === 0) save();
+                  pump();
+                });
+              })(next++);
+            }
+            if(STOPPING[type] && active === 0) resolve();
+          }
+          pump();
+        });
+      })
+      .then(function(){ return save(); })
+      .then(function(){
+        var okN = 0;
+        for(var i = 0; i < results.length; i++) if(results[i] && results[i].ok) okN++;
+        finish(type, LABELS[type] + ' ' + (STOPPING[type] ? '已暂停，本轮可用 ' : '优选完成，本轮可用 ') + okN + ' 个');
+      })
+      .catch(function(e){
+        finish(type, LABELS[type] + ' ' + ((e && (e.friendly || e.message)) || '优选失败'));
+      });
   }
 
   // 暂停优选 = 不再发下一批；已经在跑的那一批会跑完再停，进度不丢
@@ -3568,11 +4671,21 @@ code{background:#f2f4f7;border:1px solid var(--line2);border-radius:6px;padding:
     if(!r.ok){
       return '<span class="pill bad">✕ 失败</span>'
         + '<span class="err">' + esc(r.error || '未知错误') + '</span>'
-        + '<span class="tag mono">' + esc(r.latency) + ' ms</span>';
+        + (r.latency ? '<span class="tag mono">' + esc(r.latency) + ' ms</span>' : '');
     }
     return '<span class="pill ok">✓ 通过</span>'
       + '<span class="geo">' + esc(r.location || r.exitIp || '—') + '</span>'
       + '<span class="tag mono">' + esc(r.latency) + ' ms</span>';
+  }
+
+  function showTest(type, r){
+    var out = el('testout-' + type);
+    var show = function(){
+      out.className = 'tres ' + (r.ok ? 'ok' : 'bad');
+      out.innerHTML = testHtml(r);
+    };
+    if(r.ok && r.exitIp){ lookupGeo(r.exitIp, function(loc){ r.location = loc; show(); }); }
+    else { show(); }
   }
 
   function doTest(type){
@@ -3583,13 +4696,18 @@ code{background:#f2f4f7;border:1px solid var(--line2);border-radius:6px;padding:
     out.className = 'tres';
     if(!address){ out.textContent = '请先填一个地址'; return; }
     out.textContent = '测试中…';
+    // 优选域名 / 优选IP 都从本机浏览器发请求，只是取参数的端点不同
+    if(type === 'cfdomain' || type === 'cfip'){
+      var runOne = (type === 'cfip') ? testCfIp : testCf;
+      runOne(address, typeCfg(type).timeoutMs).then(function(r){
+        showTest(type, r);
+      }).catch(function(e){
+        showTest(type, { ok: false, error: (e && e.message) || '失败' });
+      });
+      return;
+    }
     api('/api/test', { type: type, address: address }).then(function(r){
-      var show = function(){
-        out.className = 'tres ' + (r.ok ? 'ok' : 'bad');
-        out.innerHTML = testHtml(r);
-      };
-      if(r.ok && r.exitIp){ lookupGeo(r.exitIp, function(loc){ r.location = loc; show(); }); }
-      else { show(); }
+      showTest(type, r);
     }).catch(function(e){
       out.className = 'tres bad';
       out.innerHTML = '<span class="pill bad">✕ 异常</span><span class="err">' + esc(e.message) + '</span>';
@@ -3604,6 +4722,19 @@ code{background:#f2f4f7;border:1px solid var(--line2);border-radius:6px;padding:
   bind('btnSettings', openSettings);
   bind('btnSettingsCancel', closeSettings);
   bind('btnSettingsSave', saveSettings);
+  // 来源管理：增行 / 删行 / 保存
+  bind('btnSrcAdd', addSrcRow);
+  bind('btnSrcCancel', closeSources);
+  bind('btnSrcSave', saveSources);
+  (function(){
+    var box = el('srcRows');
+    if(box) box.addEventListener('click', function(ev){
+      var btn = ev.target && ev.target.closest ? ev.target.closest('[data-delsrc]') : null;
+      if(!btn) return;
+      var row = btn.parentNode;
+      if(row && row.parentNode) row.parentNode.removeChild(row);
+    });
+  })();
   bind('btnRegenToken', regenToken);
   // 点击令牌区域复制
   (function(){
@@ -3621,6 +4752,8 @@ code{background:#f2f4f7;border:1px solid var(--line2);border-radius:6px;padding:
   (function(){
     var m = el('mSettings');
     if(m) m.addEventListener('click', function(ev){ if(ev.target === m) closeSettings(); });
+    var ms = el('mSources');
+    if(ms) ms.addEventListener('click', function(ev){ if(ev.target === ms) closeSources(); });
   })();
 
   renderBoot();
@@ -3658,49 +4791,58 @@ export default {
     if (!env.CSP) return;
     const cfg = await loadConfig(env);
     const types = (cfg.autoTypes || []).filter((t) => PROTOCOLS.indexOf(t) !== -1);
-    const domainCode = resolveCountryCode(cfg.domain);
     ctx.waitUntil((async () => {
       const summary = [];
-      // 每轮只跑一个协议：游标存在 meta.autoCursor，跑完推进一格，五个协议依次轮转
+      // 每轮只跑一个类型：游标存在 meta.autoCursor，跑完推进一格，七类依次轮转
       const meta = await kvGet(env, "meta", {});
       const cursor = types.length ? (parseInt(meta.autoCursor, 10) || 0) % types.length : 0;
       const nextCursor = types.length ? (cursor + 1) % types.length : 0;
       for (const type of types.slice(cursor, cursor + 1)) {
         try {
-          const poolCount = await fetchAndStore(env, type, cfg);
-          // 本轮协议固定测 autoSample 条：先取 DOMAIN 指定地区的节点，
-          // 不足抽样数时从全池随机补齐。这样既保住地区偏好，又把子请求额度集中给单个协议。
-          const sampleCount = cfg.autoSample;
-          const regions = domainCode ? [domainCode] : [];
-          const pool = await kvGet(env, "pool:" + type, { items: [] });
-          const poolItems = Array.isArray(pool.items) ? pool.items : [];
-          if (!poolItems.length) {
-            summary.push(type + "池" + poolCount + "/池为空已跳过");
+          const isCf = CF_TYPES.indexOf(type) !== -1;
+          // 定时用这一类自己选的地区；没选地区就跳过这一类。
+          // 优选IP / 优选域名没有地区概念，候选里也没有国家字段，直接按来源测
+          const typeRegions = isCf ? [] : await getRegions(env, type);
+          if (!isCf && !typeRegions.length) {
+            summary.push(type + ":未选地区已跳过");
             continue;
           }
-          const regionHits = regions.length
-            ? poolItems.filter((x) => pickCountry(x) === domainCode)
-            : poolItems;
+          const domainCode = typeRegions[0] || "";
+          // 只拉当前选中的那一份来源
+          const selLib = libSelOf(cfg, type);
+          const fresh = await fetchCandidates(type, cfg, selLib);
+          if (!fresh.length) {
+            summary.push(type + "/当前来源没拉到节点已跳过");
+            continue;
+          }
+          // 本轮按这一类自己的「自动数量」抽样：先取所选地区的节点，
+          // 不足抽样数时从剩余里随机补齐。这样既保住地区偏好，又把子请求额度集中给单个类型。
+          const sampleCount = typeCfgOf(cfg, type).autoSample;
+          const hits = domainCode ? fresh.filter((x) => pickCountry(x) === domainCode) : fresh;
           let sample;
-          if (regionHits.length >= sampleCount) {
-            sample = randomSample(regionHits, sampleCount);
+          if (hits.length >= sampleCount) {
+            sample = randomSample(hits, sampleCount);
           } else {
             // 地区节点不足抽样数 → 全取，再从剩余（非该地区）里随机补足
-            const hitSet = new Set(regionHits);
-            const rest = poolItems.filter((x) => !hitSet.has(x));
-            sample = regionHits.concat(randomSample(rest, sampleCount - regionHits.length));
+            const hitSet = new Set(hits);
+            const rest = fresh.filter((x) => !hitSet.has(x));
+            sample = hits.concat(randomSample(rest, sampleCount - hits.length));
           }
-          await kvPut(env, "pool:" + type, Object.assign({}, pool, { items: sample }));
-          regions.length = 0;   // 已自行抽样，runChunk 不再按地区过滤
+          // 池子里其它来源的旧候选原样留着（面板切源时还有数据可看），当前源换成这次抽到的这批
+          const oldPool = await kvGet(env, "pool:" + type, { items: [] });
+          const keep = (Array.isArray(oldPool.items) ? oldPool.items : []).filter((x) => x.lib && x.lib !== selLib);
+          await kvPut(env, "pool:" + type, {
+            fetchedAt: Date.now(), count: keep.length + sample.length, items: keep.concat(sample),
+          });
           summary.push(
-            type + "(" + (domainCode || "全部") + ")池" + poolCount +
-            "/地区命中" + regionHits.length + "，本轮抽样" + sample.length + "条"
+            type + (domainCode ? "(" + domainCode + ")" : "") + "拉" + fresh.length +
+            (domainCode ? "/地区命中" + hits.length : "") + "，本轮抽样" + sample.length + "条"
           );
           let guard = 0;
           let result = null;
           do {
             // 第一片强制 restart：定时任务每轮都从零跑，不受上一轮结果影响
-            result = await runChunk(env, type, cfg, guard === 0, regions);
+            result = await runChunk(env, type, cfg, guard === 0, []);
             guard++;
           } while (!result.finished && guard < 60);
           // 把本轮结果补到上面那条摘要末尾（同一元素，不再 push 第二条）
