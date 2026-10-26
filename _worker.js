@@ -102,7 +102,7 @@ const TYPE_DEFAULTS = {
 const DEFAULT_CONFIG = {
   budgetMs: 5000,           // 单次 /api/optimize 调用的时间片（内部固定值，不在面板中暴露）
                             // 这个值也是「暂停优选」的响应上限：点暂停后，当前这一片跑完才会停
-  autoTypes: ["socks5", "http", "https", "sstp", "proxyip", "cfip", "cfdomain"],
+  autoTypes: ["socks5", "http", "https", "sstp", "proxyip"],
   sources: DEFAULT_SOURCES,
   cfSources: CF_SOURCES_DEFAULT,   // 候选来源（七类各一组），面板上可增删改
   libSel: {},               // 每类协议这一轮测哪一份来源（normalizeConfig 按 cfSources 补齐）
@@ -1912,75 +1912,11 @@ async function checkProxyIp(address, timeoutMs) {
 // 单点检测：返回 { ok, latency, exitIp, country, colo, error }
 // 与 edgetunnel / CF-Workers-CheckSocks5 一致：先把隧道建到目标站点，再在隧道里做 TLS + HTTP 请求，
 // 只有拿到真实出口 IP 才算出活；延迟取「建隧道 → 读完响应」的整段耗时
-// 优选IP：直连候选地址，TLS 的 SNI 固定用 TRACE_HOST
-// 浏览器对 IP 字面量不发 SNI，握手一定失败，所以这一路只能放到 Worker 里测
-async function checkCfIp(address, timeoutMs, samples) {
-  const text = String(address || "").trim();
-  let host = "";
-  let port = CF_DEFAULT_PORT;
-  const bracketed = /^\[(.+)]:(\d{1,5})$/.exec(text);
-  if (bracketed) {
-    host = bracketed[1];
-    port = parseInt(bracketed[2], 10);
-  } else {
-    const pos = text.lastIndexOf(":");
-    if (pos > 0 && /^\d{1,5}$/.test(text.slice(pos + 1))) {
-      host = text.slice(0, pos);
-      port = parseInt(text.slice(pos + 1), 10);
-    } else {
-      host = text;
-    }
-  }
-  if (!host) return { ok: false, latency: 0, error: "地址格式无效" };
-
-  // 与优选域名同一条测法：串行测多次取最小值（单点测试传 3，批量优选仍只测 1 次）
-  const times = Math.max(1, Math.min(5, parseInt(samples, 10) || 1));
-  const samplesMs = [];
-  let lastError = null;
-  let lastMs = 0;
-  let info = null;
-  for (let i = 0; i < times; i++) {
-    const started = Date.now();
-    let socket = null;
-    try {
-      socket = connect({ hostname: host, port });
-      await withTimeout(socket.opened, timeoutMs, "TCP 连接超时");
-      const body = await tlsGetOverSocket(socket, TRACE_HOST, TRACE_PORT, TRACE_PATH, timeoutMs);
-      const parsed = parseTrace(body);
-      if (!parsed.colo) throw new Error("没有返回 Cloudflare trace");
-      samplesMs.push(Math.max(1, Date.now() - started));
-      info = parsed;
-    } catch (error) {
-      lastError = error;
-      lastMs = Date.now() - started;
-    } finally {
-      try { socket && socket.close && socket.close(); } catch (e) {}
-    }
-  }
-  if (!samplesMs.length) {
-    return { ok: false, latency: lastMs, error: String((lastError && lastError.message) || lastError || "检测失败") };
-  }
-  return {
-    ok: true,
-    latency: Math.min.apply(null, samplesMs),
-    exitIp: host,
-    country: info.loc || "",
-    colo: info.colo,
-  };
-}
-
 async function runCheck(type, address, opts) {
   const options = opts || {};
   const timeoutMs = options.timeoutMs || typeCfgOf(options, type).timeoutMs;
   const started = Date.now();
   if (type === "proxyip") return await checkProxyIp(address, timeoutMs);
-  if (type === "cfip") return await checkCfIp(address, timeoutMs, options.samples);
-  // 优选域名在 Worker 里测：直连候选的 443 拿 cdn-cgi/trace，量的是机房到目标的往返，
-  // 与面板上用浏览器测的口径不同（定时任务用它，够用来筛掉完全不通的域名）
-  if (type === "cfdomain") {
-    const r = await checkCfIp(address, timeoutMs, options.samples);
-    return Object.assign({}, r, { exitIp: "" });
-  }
 
   let socket = null;
   try {
@@ -2507,7 +2443,7 @@ async function kvPut(env, key, value) {
 // v5 起候选来源（段表列表 / 域名名单）存在 cfSources 里，面板上可增删改。
 // v6 起这个字段覆盖全部七类：另外五类（SOCKS5 / HTTP / HTTPS / SSTP / ProxyIP）的列表源也能在面板上改。
 // v7 起「这一轮测哪一份来源」从单一 cfLib 改成每类一份 libSel，七类页面上都有来源下拉。
-// v8 起定时优选也覆盖七类：autoTypes 补上 cfip / cfdomain，且每轮只拉当前选中的那一份来源。
+// v8 起每轮只拉当前选中的那一份来源；定时优选只跑前五类，cfip / cfdomain 由浏览器手动测。
 const CONFIG_VERSION = 8;
 
 function normalizeConfig(raw) {
@@ -2544,9 +2480,8 @@ function normalizeConfig(raw) {
   delete cfg.maxPerType;
   delete cfg.sstpTimeoutMs;                 // 已合并进 timeoutMs，洗掉旧配置里的字段
   if (!Array.isArray(cfg.autoTypes)) cfg.autoTypes = DEFAULT_CONFIG.autoTypes.slice();
-  // 定时优选的类型集合：七类都能进，轮到时按该类当前选中的来源测一遍
-  // v7 及以前存的是五类（没有 cfip / cfdomain），升级时补齐
-  cfg.autoTypes = cfg.autoTypes.filter((t) => PROTOCOLS.indexOf(t) !== -1);
+  // 定时优选的类型集合：只跑前五类代理，cfip / cfdomain 必须由浏览器测，不参与定时优选
+  cfg.autoTypes = cfg.autoTypes.filter((t) => PROTOCOLS.indexOf(t) !== -1 && CF_TYPES.indexOf(t) === -1);
   if ((parseInt(raw && raw.v, 10) || 0) < 8) {
     cfg.autoTypes = DEFAULT_CONFIG.autoTypes.slice();
   }
@@ -3187,10 +3122,10 @@ async function handleApi(request, env, url, ctx) {
     return json({ success: true, type, regions, filteredCount: state.types[type].filteredCount });
   }
 
-  if (path === "/api/optimize") {
+    if (path === "/api/optimize") {
     if (PROTOCOLS.indexOf(type) === -1) return json({ error: "类型无效" }, 400);
-    // CF 域名由浏览器测（要带 SNI、量本机到目标），结果走 /api/cfresults
-    if (type === "cfdomain") return json({ success: false, type, error: "这一类由浏览器检测，走 /api/cfresults" }, 200);
+    // CF IP / CF 域名由浏览器测（要带 SNI、量本机到目标），结果走 /api/cfresults
+    if (type === "cfip" || type === "cfdomain") return json({ success: false, type, error: "这一类由浏览器检测，走 /api/cfresults" }, 200);
     try {
       const result = await runChunk(env, type, cfg, !!body.restart);
       if (result.finished) {
@@ -3963,7 +3898,7 @@ code{background:#f2f4f7;border:1px solid var(--line2);border-radius:6px;padding:
     if(type === 'cfip') html += '<span class="param"><label>每次拉取</label><input type="number" data-tcfg="pullCount" data-type="' + type + '" min="1" max="4096" value="' + tc.pullCount + '"></span>';
     html += '<span class="param"><label>并发数量</label><input type="number" data-tcfg="concurrency" data-type="' + type + '" min="1" max="32" value="' + tc.concurrency + '"></span>';
     html += '<span class="param"><label>超时时间</label><input type="number" data-tcfg="timeoutMs" data-type="' + type + '" min="100" max="120000" step="100" value="' + tc.timeoutMs + '"><span class="u">ms</span></span>';
-    html += '<span class="param"><label>自动优选数量</label><input type="number" data-tcfg="autoSample" data-type="' + type + '" min="1" max="4096" value="' + tc.autoSample + '"></span>';
+    if(type !== 'cfdomain' && type !== 'cfip') html += '<span class="param"><label>自动优选数量</label><input type="number" data-tcfg="autoSample" data-type="' + type + '" min="1" max="4096" value="' + tc.autoSample + '"></span>';
     html += '</div></div>';
     html += '</div>';
     html += '<div class="toolbar">';
@@ -4797,20 +4732,18 @@ export default {
   async scheduled(event, env, ctx) {
     if (!env.CSP) return;
     const cfg = await loadConfig(env);
-    const types = (cfg.autoTypes || []).filter((t) => PROTOCOLS.indexOf(t) !== -1);
+    const types = (cfg.autoTypes || []).filter((t) => PROTOCOLS.indexOf(t) !== -1 && CF_TYPES.indexOf(t) === -1);
     ctx.waitUntil((async () => {
       const summary = [];
-      // 每轮只跑一个类型：游标存在 meta.autoCursor，跑完推进一格，七类依次轮转
+      // 每轮只跑一个类型：游标存在 meta.autoCursor，跑完推进一格，五类依次轮转
       const meta = await kvGet(env, "meta", {});
       const cursor = types.length ? (parseInt(meta.autoCursor, 10) || 0) % types.length : 0;
       const nextCursor = types.length ? (cursor + 1) % types.length : 0;
       for (const type of types.slice(cursor, cursor + 1)) {
         try {
-          const isCf = CF_TYPES.indexOf(type) !== -1;
           // 定时用这一类自己选的地区；没选地区就跳过这一类。
-          // 优选IP / 优选域名没有地区概念，候选里也没有国家字段，直接按来源测
-          const typeRegions = isCf ? [] : await getRegions(env, type);
-          if (!isCf && !typeRegions.length) {
+          const typeRegions = await getRegions(env, type);
+          if (!typeRegions.length) {
             summary.push(type + ":未选地区已跳过");
             continue;
           }
