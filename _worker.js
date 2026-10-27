@@ -3252,6 +3252,7 @@ function renderPanel(cfg, subToken) {
     continents: CONTINENT_LABEL,
     continentOrder: CONTINENT_ORDER,
     countryZh: COUNTRY_ZH,
+    coloCC: CF_COLO_CC,
     config: cfg,
     // 每类协议的下拉选项：来源列表在面板上可改，改完前端直接用新列表重画
     libs: Object.fromEntries(PROTOCOLS.map((t) => [
@@ -4626,6 +4627,15 @@ code{background:#f2f4f7;border:1px solid var(--line2);border-radius:6px;padding:
       out.className = 'tres ' + (r.ok ? 'ok' : 'bad');
       out.innerHTML = testHtml(r);
     };
+    // CF 两类的 exitIp 是访问者自己的出口 IP，查归属地只会显示访问者所在地；
+    // 与结果表保持一致，改看请求落到的机房 colo
+    if(r.ok && (type === 'cfip' || type === 'cfdomain')){
+      var colo = String(r.colo || '').toUpperCase();
+      var cc = (BOOT.coloCC && BOOT.coloCC[colo]) || '';
+      r.location = cc ? ((BOOT.countryZh && BOOT.countryZh[cc]) || cc) : (colo || '—');
+      show();
+      return;
+    }
     if(r.ok && r.exitIp){ lookupGeo(r.exitIp, function(loc){ r.location = loc; show(); }); }
     else { show(); }
   }
