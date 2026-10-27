@@ -103,7 +103,6 @@ const DEFAULT_CONFIG = {
   budgetMs: 5000,           // 单次 /api/optimize 调用的时间片（内部固定值，不在面板中暴露）
                             // 这个值也是「暂停优选」的响应上限：点暂停后，当前这一片跑完才会停
   autoTypes: ["socks5", "http", "https", "sstp", "proxyip"],
-  sources: DEFAULT_SOURCES,
   cfSources: CF_SOURCES_DEFAULT,   // 候选来源（七类各一组），面板上可增删改
   libSel: {},               // 每类协议这一轮测哪一份来源（normalizeConfig 按 cfSources 补齐）
   typeCfg: TYPE_DEFAULTS,   // 每类协议自己的并发 / 超时 / 定时抽样数
@@ -1912,9 +1911,8 @@ async function checkProxyIp(address, timeoutMs) {
 // 单点检测：返回 { ok, latency, exitIp, country, colo, error }
 // 与 edgetunnel / CF-Workers-CheckSocks5 一致：先把隧道建到目标站点，再在隧道里做 TLS + HTTP 请求，
 // 只有拿到真实出口 IP 才算出活；延迟取「建隧道 → 读完响应」的整段耗时
-async function runCheck(type, address, opts) {
-  const options = opts || {};
-  const timeoutMs = options.timeoutMs || typeCfgOf(options, type).timeoutMs;
+async function runCheck(type, address, cfg) {
+  const timeoutMs = typeCfgOf(cfg, type).timeoutMs;
   const started = Date.now();
   if (type === "proxyip") return await checkProxyIp(address, timeoutMs);
 
@@ -2479,12 +2477,9 @@ function normalizeConfig(raw) {
   delete cfg.maxPool;
   delete cfg.maxPerType;
   delete cfg.sstpTimeoutMs;                 // 已合并进 timeoutMs，洗掉旧配置里的字段
-  if (!Array.isArray(cfg.autoTypes)) cfg.autoTypes = DEFAULT_CONFIG.autoTypes.slice();
   // 定时优选的类型集合：只跑前五类代理，cfip / cfdomain 必须由浏览器测，不参与定时优选
-  cfg.autoTypes = cfg.autoTypes.filter((t) => PROTOCOLS.indexOf(t) !== -1 && CF_TYPES.indexOf(t) === -1);
-  if ((parseInt(raw && raw.v, 10) || 0) < 8) {
-    cfg.autoTypes = DEFAULT_CONFIG.autoTypes.slice();
-  }
+  cfg.autoTypes = (Array.isArray(cfg.autoTypes) ? cfg.autoTypes : DEFAULT_CONFIG.autoTypes)
+    .filter((t) => PROTOCOLS.indexOf(t) !== -1 && CF_TYPES.indexOf(t) === -1);
   if (!cfg.autoTypes.length) cfg.autoTypes = DEFAULT_CONFIG.autoTypes.slice();
   cfg.cfSources = sanitizeCfSources(raw && raw.cfSources);
   // 每类协议各记一份「这一轮测哪一份来源」：值必须是该类来源列表里的 key，
@@ -2500,7 +2495,6 @@ function normalizeConfig(raw) {
   delete cfg.cfLib;
   delete cfg.cfPort;
   delete cfg.cfLimit;
-  cfg.sources = Object.assign({}, DEFAULT_SOURCES, cfg.sources || {});
   cfg.v = CONFIG_VERSION;
   return cfg;
 }
@@ -3122,10 +3116,10 @@ async function handleApi(request, env, url, ctx) {
     return json({ success: true, type, regions, filteredCount: state.types[type].filteredCount });
   }
 
-    if (path === "/api/optimize") {
+  if (path === "/api/optimize") {
+    // CF IP / CF 域名由浏览器测，结果走 /api/cfresults
+    if (CF_TYPES.indexOf(type) !== -1) return json({ success: false, type, error: "这一类由浏览器检测，走 /api/cfresults" }, 200);
     if (PROTOCOLS.indexOf(type) === -1) return json({ error: "类型无效" }, 400);
-    // CF IP / CF 域名由浏览器测（要带 SNI、量本机到目标），结果走 /api/cfresults
-    if (type === "cfip" || type === "cfdomain") return json({ success: false, type, error: "这一类由浏览器检测，走 /api/cfresults" }, 200);
     try {
       const result = await runChunk(env, type, cfg, !!body.restart);
       if (result.finished) {
@@ -3143,8 +3137,7 @@ async function handleApi(request, env, url, ctx) {
   if (path === "/api/test") {
     if (PROTOCOLS.indexOf(type) === -1) return json({ error: "类型无效" }, 400);
     if (!body.address) return json({ error: "缺少 address" }, 400);
-    // 单点测试与优选域名同一条测法：串行测 3 次取最小值
-    const result = await runCheck(type, body.address, Object.assign({}, cfg, { samples: 3 }));
+    const result = await runCheck(type, body.address, cfg);
     return json(Object.assign({ success: true, type, address: body.address }, result));
   }
 
@@ -4629,15 +4622,16 @@ code{background:#f2f4f7;border:1px solid var(--line2);border-radius:6px;padding:
     };
     // CF 两类的 exitIp 是访问者自己的出口 IP，查归属地只会显示访问者所在地；
     // 与结果表保持一致，改看请求落到的机房 colo
-    if(r.ok && (type === 'cfip' || type === 'cfdomain')){
+    if(r.ok && CF_TYPES.indexOf(type) !== -1){
       var colo = String(r.colo || '').toUpperCase();
       var cc = (BOOT.coloCC && BOOT.coloCC[colo]) || '';
       r.location = cc ? ((BOOT.countryZh && BOOT.countryZh[cc]) || cc) : (colo || '—');
       show();
-      return;
+    } else if(r.ok && r.exitIp){
+      lookupGeo(r.exitIp, function(loc){ r.location = loc; show(); });
+    } else {
+      show();
     }
-    if(r.ok && r.exitIp){ lookupGeo(r.exitIp, function(loc){ r.location = loc; show(); }); }
-    else { show(); }
   }
 
   function doTest(type){
@@ -4742,7 +4736,7 @@ export default {
   async scheduled(event, env, ctx) {
     if (!env.CSP) return;
     const cfg = await loadConfig(env);
-    const types = (cfg.autoTypes || []).filter((t) => PROTOCOLS.indexOf(t) !== -1 && CF_TYPES.indexOf(t) === -1);
+    const types = cfg.autoTypes;
     ctx.waitUntil((async () => {
       const summary = [];
       // 每轮只跑一个类型：游标存在 meta.autoCursor，跑完推进一格，五类依次轮转
@@ -4757,7 +4751,7 @@ export default {
             summary.push(type + ":未选地区已跳过");
             continue;
           }
-          const domainCode = typeRegions[0] || "";
+          const regionCode = typeRegions[0];
           // 只拉当前选中的那一份来源
           const selLib = libSelOf(cfg, type);
           const fresh = await fetchCandidates(type, cfg, selLib);
@@ -4768,7 +4762,7 @@ export default {
           // 本轮按这一类自己的「自动数量」抽样：先取所选地区的节点，
           // 不足抽样数时从剩余里随机补齐。这样既保住地区偏好，又把子请求额度集中给单个类型。
           const sampleCount = typeCfgOf(cfg, type).autoSample;
-          const hits = domainCode ? fresh.filter((x) => pickCountry(x) === domainCode) : fresh;
+          const hits = fresh.filter((x) => pickCountry(x) === regionCode);
           let sample;
           if (hits.length >= sampleCount) {
             sample = randomSample(hits, sampleCount);
@@ -4785,8 +4779,8 @@ export default {
             fetchedAt: Date.now(), count: keep.length + sample.length, items: keep.concat(sample),
           });
           summary.push(
-            type + (domainCode ? "(" + domainCode + ")" : "") + "拉" + fresh.length +
-            (domainCode ? "/地区命中" + hits.length : "") + "，本轮抽样" + sample.length + "条"
+            type + "(" + regionCode + ")拉" + fresh.length +
+            "/地区命中" + hits.length + "，本轮抽样" + sample.length + "条"
           );
           let guard = 0;
           let result = null;
@@ -4796,7 +4790,7 @@ export default {
             guard++;
           } while (!result.finished && guard < 60);
           // 把本轮结果补到上面那条摘要末尾（同一元素，不再 push 第二条）
-          summary[summary.length - 1] += "/可用" + (result ? result.ok : 0);
+          summary[summary.length - 1] += "/可用" + result.ok;
         } catch (e) {
           summary.push(type + ":失败(" + ((e && e.message) || e) + ")");
         }
