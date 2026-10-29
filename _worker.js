@@ -294,6 +294,74 @@ function continentOf(code) {
   return COUNTRY_CONTINENT[String(code || "").toUpperCase()] || "OTHER";
 }
 
+/* ---- 纯文本名单 ----
+ * 一行一个地址，可以跟 #备注 写地区，例如：
+ *   sstp://vpn:vpn@a.opengw.net:443#JP
+ *   sstp://vpn:vpn@b.opengw.net:443#SSTP-日本-1234ms
+ *   sstp://vpn:vpn@c.opengw.net:443
+ * 没有 #、或者 # 后面认不出地区，也照样收进候选，地区留空（面板上归到「未知」）。
+ */
+let COUNTRY_CODE_BY_ZH = null;
+
+function countryFromRemark(remark) {
+  const text = String(remark || "").trim();
+  if (!text) return "";
+  // JP / SSTP-JP-1234ms 这类用两位国家码的写法
+  const m = /(?:^|[-_\s(（])([A-Za-z]{2})(?=[-_\s)）]|$)/.exec(text);
+  if (m) {
+    const code = m[1].toUpperCase();
+    if (COUNTRY_ZH[code]) return code;
+  }
+  // 日本 / SSTP-日本-1234ms 这类用中文国名的写法
+  if (!/[^\x00-\x7f]/.test(text)) return "";
+  if (!COUNTRY_CODE_BY_ZH) {
+    COUNTRY_CODE_BY_ZH = {};
+    for (const code of Object.keys(COUNTRY_ZH)) {
+      const name = COUNTRY_ZH[code];
+      if (name && !COUNTRY_CODE_BY_ZH[name]) COUNTRY_CODE_BY_ZH[name] = code;
+    }
+  }
+  for (const name of Object.keys(COUNTRY_CODE_BY_ZH)) {
+    if (text.indexOf(name) !== -1) return COUNTRY_CODE_BY_ZH[name];
+  }
+  return "";
+}
+
+const TEXT_HOST_PORT = /^(?:[A-Za-z0-9](?:[A-Za-z0-9.-]*[A-Za-z0-9])?|\[[0-9a-fA-F:.]+\]):\d{1,5}$/;
+
+function parseAddressText(text, type) {
+  const out = [];
+  for (const rawLine of String(text || "").split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.charAt(0) === "#" || line.slice(0, 2) === "//") continue;
+    const hashAt = line.indexOf("#");
+    const body = (hashAt === -1 ? line : line.slice(0, hashAt)).trim();
+    const remark = hashAt === -1 ? "" : line.slice(hashAt + 1);
+    if (!body) continue;
+    let rest = body;
+    const schemeAt = rest.indexOf("://");
+    if (schemeAt !== -1) rest = rest.slice(schemeAt + 3);
+    const at = rest.lastIndexOf("@");
+    if (at !== -1) rest = rest.slice(at + 1);
+    if (!TEXT_HOST_PORT.test(rest)) continue;   // 不是 host:port 的行直接跳过（JSON、说明文字都会被挡住）
+    const address = (schemeAt !== -1 || type === "proxyip") ? body : type + "://" + body;
+    const cc = countryFromRemark(remark);
+    out.push({
+      address,
+      country: cc,
+      countryCn: "",
+      countryEn: "",
+      countryEmoji: "",
+      continent: continentOf(cc),
+      continentCn: "",
+      city: "",
+      asn: "",
+      org: "",
+    });
+  }
+  return out;
+}
+
 /* ========================================================================== *
  *  二、协议实现（socks5 / http / https / sstp）
  * ========================================================================== */
@@ -2380,21 +2448,36 @@ async function fetchCandidates(type, cfg, onlyLib) {
       const res = await fetchWithTimeout(row.url, 45000, { headers: { "User-Agent": "Mozilla/5.0" } });
       if (!res.ok) throw new Error("HTTP " + res.status);
       // VPN Gate 官方源是 CSV、镜像是 JSON，按内容判断；其余四类是 JSON 名单
-      if (type === "sstp") return { key: row.key, items: parseSstpText(await res.text()) };
-      const data = await res.json();
-      const items = type === "proxyip" ? parseProxyIpList(data) : parseProxyList(data, type);
+      const body = await res.text();
+      if (type === "sstp") return { key: row.key, items: parseSstpText(body) };
+      let items = [];
+      try {
+        const data = JSON.parse(body);
+        items = type === "proxyip" ? parseProxyIpList(data) : parseProxyList(data, type);
+      } catch (e) {}
+      // JSON 不是名单（或是空表）就按纯文本名单再收一次：一行一个地址，可带 #地区
+      if (!items.length) items = parseAddressText(body, type);
       return { key: row.key, items };
     } catch (e) {
       return { key: row.key, items: [] };   // 单个源不通就跳过，只要还有别的源能用
     }
   }));
   const merged = [];
-  const seen = new Set();
+  const seen = new Map();
   for (const one of lists) {
     for (const it of one.items) {
-      if (!it || !it.address || seen.has(it.address)) continue;
-      seen.add(it.address);
-      merged.push(Object.assign({}, it, { lib: one.key }));
+      if (!it || !it.address) continue;
+      const kept = seen.get(it.address);
+      if (kept) {
+        // 同一条地址在别的源里带了地区：把「未知」换成已知的那份，别让没 #地区 的源盖住
+        if (!it.country || kept.country) continue;
+        kept.country = it.country;
+        kept.continent = continentOf(it.country);
+        continue;
+      }
+      const item = Object.assign({}, it, { lib: one.key });
+      seen.set(it.address, item);
+      merged.push(item);
     }
   }
   if (!merged.length) throw new Error("数据源都没能拉到节点");
@@ -2413,7 +2496,8 @@ function parseSstpText(text) {
   }
   try { return parseVpngateCsv(s); } catch (e) {}
   try { return asJson(); } catch (e) {}
-  return [];
+  // 官方 CSV 和镜像 JSON 都不成形，就按纯文本名单收：一行一个地址，可带 #地区
+  return parseAddressText(s, "sstp");
 }
 
 /* ========================================================================== *
@@ -2669,7 +2753,9 @@ function sortedResults(entry) {
 
 function countryName(code, fallback) {
   const key = String(code || "").toUpperCase();
-  return COUNTRY_ZH[key] || fallback || key || "XX";
+  // XX = 来源里没给地区（地址后面没跟 #地区），面板上统一显示「未知」
+  if (!key || key === "XX") return fallback || "未知";
+  return COUNTRY_ZH[key] || fallback || key;
 }
 
 // 两位国家码 → 国旗 emoji，数据源没带 emoji 时（VPN Gate）用
