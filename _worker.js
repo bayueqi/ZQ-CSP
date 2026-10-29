@@ -3747,6 +3747,9 @@ code{background:#f2f4f7;border:1px solid var(--line2);border-radius:6px;padding:
         libs[pt] = (srcs[pt] || []).map(function(x){ return { key: x.key, label: x.label }; });
       }
       BOOT.libs = libs;
+      // 立刻按新列表重建下拉：后面那次 loadState 可能因为焦点停在输入框或下拉上而跳过重绘，
+      // 跳过了旧选项（含刚删掉的那一行）就会一直留在页面上，只有刷新才消失
+      syncLibSelect(type);
       closeSources();
       log(LABELS[type] + ' 来源已保存 ' + out.length + ' 行，正在按新地址拉取候选…', type);
       return api('/api/clear', { type: type }).then(function(){
@@ -3810,6 +3813,12 @@ code{background:#f2f4f7;border:1px solid var(--line2);border-radius:6px;padding:
       out += '<option value="' + esc(x.key) + '"' + (x.key === cur ? ' selected' : '') + '>' + esc(x.label) + '</option>';
     }
     return out;
+  }
+
+  // 只重建某一类的来源下拉，不动整页（整页重绘会打断正在输入的参数）
+  function syncLibSelect(type){
+    var node = document.getElementById('cfLib-' + type);
+    if(node) node.innerHTML = cfLibOptions(type);
   }
 
   function pctOf(t){ return t.total > 0 ? Math.min(100, Math.round(t.done * 100 / t.total)) : 0; }
